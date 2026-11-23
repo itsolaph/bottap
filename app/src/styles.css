@@ -1,0 +1,348 @@
+:root {
+  --bg: #111314;
+  --surface: #191c1e;
+  --surface-raised: #202427;
+  --border: #2c3135;
+  --border-strong: #3c4348;
+  --text: #eaeceb;
+  --text-muted: #8b9491;
+  --lens-bg: #050906;
+  --lens-phosphor: #64f09a;
+  --lens-dim: #2b7a4b;
+  --danger: #f59e0b;
+  --blocked: #ef4444;
+  --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Inter', system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 var(--sans);
+  touch-action: manipulation;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none;
+}
+
+.shell {
+  max-width: 540px;
+  margin: 0 auto;
+  padding: 16px 14px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.brand-name {
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.brand-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-muted);
+}
+
+.pill.live {
+  border-color: var(--lens-dim);
+  color: var(--lens-phosphor);
+}
+
+.pill.demo {
+  border-color: #6b4d16;
+  color: var(--danger);
+}
+
+.pill.offline {
+  border-color: #6b2222;
+  color: var(--blocked);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.card-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* 576x288 (2:1) G2 Waveguide Mirror */
+.lens-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 1;
+  background: var(--lens-bg);
+  border: 1px solid #1f3d2a;
+  border-radius: 6px;
+  padding: 12px 14px 10px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  overflow: hidden;
+  box-shadow: inset 0 0 28px rgba(100, 240, 154, 0.07);
+}
+
+.lens-body {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: clamp(11px, 2.7vw, 13.5px);
+  line-height: 1.42;
+  color: var(--lens-phosphor);
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-shadow: 0 0 8px rgba(100, 240, 154, 0.3);
+}
+
+.lens-footer {
+  padding-top: 6px;
+  border-top: 1px solid #13281b;
+  font-family: var(--mono);
+  font-size: clamp(9.5px, 2.2vw, 11px);
+  color: #4cc279;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ring-controls {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+button {
+  appearance: none;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-raised);
+  color: var(--text);
+  border-radius: 5px;
+  padding: 8px 10px;
+  font: 600 12px/1 var(--mono);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+button:hover {
+  border-color: #5b656c;
+  background: #272c30;
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+button.primary {
+  border-color: var(--lens-dim);
+  color: var(--lens-phosphor);
+  background: #102016;
+}
+
+button.primary:hover {
+  border-color: var(--lens-phosphor);
+  background: #142b1d;
+}
+
+button.danger-btn {
+  border-color: #6b4d16;
+  color: var(--danger);
+}
+
+button.small {
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.row > input {
+  flex: 1;
+  min-width: 0;
+}
+
+input {
+  background: #111416;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  padding: 8px 10px;
+  color: var(--text);
+  font: 13px/1.2 var(--mono);
+  outline: none;
+}
+
+input:focus {
+  border-color: var(--lens-dim);
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  background: #14181a;
+  border: 1px solid var(--border-strong);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.chip button {
+  padding: 1px 5px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.chip button:hover {
+  color: var(--blocked);
+  background: transparent;
+}
+
+.audit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.audit-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 9px;
+  background: #131618;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.audit-outcome {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 10px;
+  padding: 2px 5px;
+  border-radius: 3px;
+}
+
+.audit-outcome.pressed {
+  color: var(--lens-phosphor);
+  background: #0e2416;
+}
+
+.audit-outcome.timeout {
+  color: var(--danger);
+  background: #281e0c;
+}
+
+.audit-outcome.refused_2fa,
+.audit-outcome.refused_allowlist,
+.audit-outcome.refused_danger_unconfirmed {
+  color: var(--blocked);
+  background: #291212;
+}
+
+.hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.qr-box {
+  padding: 10px;
+  background: #111416;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  word-break: break-all;
+  color: var(--lens-phosphor);
+}
+
+.footer-tos {
+  padding-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  text-align: left;
+}

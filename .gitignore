@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.ehpk
+.env
+.env.*
+!.env.example
+data/
+*.session
+*.log
+.DS_Store
