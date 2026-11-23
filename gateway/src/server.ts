@@ -36,6 +36,8 @@ const MIME_BY_EXT: Record<string, string> = {
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, corsOrigin: string): void {

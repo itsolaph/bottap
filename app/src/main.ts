@@ -1,3 +1,12 @@
+import '@fontsource/familjen-grotesk/latin-500.css'
+import '@fontsource/familjen-grotesk/latin-600.css'
+import '@fontsource/ibm-plex-sans/latin-400.css'
+import '@fontsource/ibm-plex-sans/latin-500.css'
+import '@fontsource/jetbrains-mono/latin-400.css'
+import '@fontsource/jetbrains-mono/latin-500.css'
+import './tokens.css'
+import './styles.css'
+
 import {
   CreateStartUpPageContainer,
   OsEventTypeList,
@@ -7,16 +16,17 @@ import {
   type EvenAppBridge,
 } from '@evenrealities/even_hub_sdk'
 import {
+  formatRelativeAge,
   initialG2State,
   reduceG2State,
   type G2Action,
   type G2ViewState,
   type GatewayMode,
   type GatewayStatus,
+  type QueueItem,
 } from '@bottap/shared'
 import { GatewayClient } from './client'
 import { renderG2Frame, type G2Frame } from './g2-renderer'
-import './styles.css'
 
 const STORAGE_URL_KEY = 'bottap.gatewayUrl'
 const STORAGE_TOKEN_KEY = 'bottap.gatewayToken'
@@ -24,7 +34,6 @@ const STORAGE_TOKEN_KEY = 'bottap.gatewayToken'
 function defaultGatewayUrl(): string {
   const saved = window.localStorage.getItem(STORAGE_URL_KEY)
   if (saved) return saved
-  // In Vite dev mode (/api proxy) or self-hosted single-container mode, same-origin works cleanly
   if (window.location.port === '5173') {
     return `${window.location.origin}/api`
   }
@@ -40,13 +49,17 @@ let bridge: EvenAppBridge | null = null
 let bridgeReady = false
 let g2State: G2ViewState = initialG2State()
 let lastStatus: GatewayStatus | null = null
+let lastItems: readonly QueueItem[] = []
 let lastMeta: { allowlistCount: number; mode: GatewayMode } = {
   allowlistCount: 0,
   mode: 'live',
 }
-let lastRenderedKey = ''
+let lastRenderedLensKey = ''
+let lastQueueKey = ''
+let lastAllowlistKey = ''
+let lastAuditKey = ''
+let lastAnnounced = ''
 let bridgeWriteQueue: Promise<unknown> = Promise.resolve()
-let pairingMessage = ''
 let qrPollTimer: number | null = null
 
 // Official Even Hub protobuf envelope helper:
@@ -56,21 +69,42 @@ function eventTypeOf(envelope?: { eventType?: OsEventTypeList }): OsEventTypeLis
   return envelope.eventType ?? OsEventTypeList.CLICK_EVENT
 }
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+function el<T extends HTMLElement>(id: string): T | null {
+  return document.getElementById(id) as T | null
+}
+
+function announce(message: string): void {
+  if (!message || message === lastAnnounced) return
+  lastAnnounced = message
+  const sr = el('sr-announce')
+  if (sr) sr.textContent = message
+}
+
+// Uniformly scale the true 576x288 framebuffer inside .g2-viewport so mobile never wraps/reflows
+function setupFramebufferScale(): void {
+  const viewport = el('g2-viewport')
+  const fb = el('g2-framebuffer')
+  if (!viewport || !fb) return
+
+  const updateScale = () => {
+    const w = viewport.clientWidth
+    if (w <= 0) return
+    const scale = w / 576
+    fb.style.transform = `scale(${scale})`
+  }
+
+  updateScale()
+  const ro = new ResizeObserver(updateScale)
+  ro.observe(viewport)
 }
 
 function pushFrameToG2(frame: G2Frame): void {
   const key = `${frame.body}\u0000${frame.footer}`
-  if (key === lastRenderedKey) return
-  lastRenderedKey = key
+  if (key === lastRenderedLensKey) return
+  lastRenderedLensKey = key
 
-  const bodyEl = document.getElementById('lens-body')
-  const footerEl = document.getElementById('lens-footer')
+  const bodyEl = el('lens-body')
+  const footerEl = el('lens-footer')
   if (bodyEl) bodyEl.textContent = frame.body
   if (footerEl) footerEl.textContent = frame.footer
 
@@ -97,16 +131,459 @@ function pushFrameToG2(frame: G2Frame): void {
     .catch((err) => console.error('[bottap] G2 upgrade failed:', err))
 }
 
-function renderAll(): void {
+function updateHardwareStateChrome(): void {
+  const pageRoot = el('page-root')
+  const stepQueue = el('step-queue')
+  const stepButtons = el('step-buttons')
+  const stepGate = el('step-gate')
+  const stepResult = el('step-result')
+  const armStrip = el('arm-strip')
+  const armLabel = el('arm-strip-label')
+  const tapLabel = el('ring-tap-label')
+
+  const isQueue =
+    g2State.screen === 'queue' ||
+    g2State.screen === 'empty' ||
+    g2State.screen === 'loading' ||
+    g2State.screen === 'offline' ||
+    g2State.screen === 'unpaired'
+  const isButtons = g2State.screen === 'buttons'
+  const isDanger = g2State.screen === 'danger_confirm'
+  const isRefusal = g2State.screen === 'refusal'
+  const isGate = isDanger || isRefusal
+  const isResult = g2State.screen === 'pressing' || g2State.screen === 'result'
+
+  stepQueue?.setAttribute('data-active', String(isQueue))
+  stepButtons?.setAttribute('data-active', String(isButtons))
+  stepGate?.setAttribute('data-active', String(isGate && !isDanger))
+  stepGate?.setAttribute('data-danger', String(isDanger))
+  stepResult?.setAttribute('data-active', String(isResult))
+
+  pageRoot?.setAttribute('data-arm', isDanger ? 'danger' : 'idle')
+
+  if (tapLabel) {
+    tapLabel.textContent = isDanger ? 'Confirm' : 'Tap'
+  }
+
+  if (armStrip && armLabel) {
+    if (g2State.screen === 'danger_confirm') {
+      const item = g2State.items[g2State.itemIndex]
+      const btn = item?.buttons[g2State.buttonIndex]
+      armStrip.hidden = false
+      armLabel.textContent = btn ? `Armed: ${btn.label}, tap Confirm` : 'Destructive action armed'
+      if (btn) announce(`${btn.label} armed, tap Confirm to execute`)
+    } else {
+      armStrip.hidden = true
+    }
+  }
+
+  if (g2State.screen === 'refusal') {
+    announce(`Blocked on glasses: ${g2State.headline}`)
+  }
+}
+
+function renderTopStatus(): void {
+  const readout = el('status-readout')
+  const label = el('status-label')
+  const dialogSpec = el('dialog-spec')
+
+  if (!readout || !label) return
+  if (!lastStatus) {
+    readout.setAttribute('data-state', 'offline')
+    label.textContent = 'Offline'
+    if (dialogSpec) dialogSpec.textContent = 'Gateway offline'
+  } else if (lastStatus.mode === 'demo') {
+    readout.setAttribute('data-state', 'demo')
+    label.textContent = 'Demo sandbox'
+    if (dialogSpec) dialogSpec.textContent = 'Offline sandbox fixtures'
+  } else if (lastStatus.pairing.status === 'paired') {
+    readout.setAttribute('data-state', 'live')
+    label.textContent = lastStatus.pairing.accountLabel || 'Live gateway'
+    if (dialogSpec) dialogSpec.textContent = 'MTProto Layer 234 paired'
+  } else {
+    readout.setAttribute('data-state', 'offline')
+    label.textContent = 'Unpaired'
+    if (dialogSpec) dialogSpec.textContent = 'MTProto Layer 234 unpaired'
+  }
+}
+
+function activeFocusedInfo(): { itemId: string | null; armedButtonB64: string | null } {
+  if (g2State.screen === 'queue') {
+    return { itemId: g2State.items[g2State.cursor]?.id ?? null, armedButtonB64: null }
+  }
+  if (g2State.screen === 'buttons') {
+    return { itemId: g2State.items[g2State.itemIndex]?.id ?? null, armedButtonB64: null }
+  }
+  if (g2State.screen === 'danger_confirm') {
+    const item = g2State.items[g2State.itemIndex]
+    const btn = item?.buttons[g2State.buttonIndex]
+    return { itemId: item?.id ?? null, armedButtonB64: btn?.dataB64 ?? null }
+  }
+  if (g2State.screen === 'pressing') {
+    return { itemId: g2State.item.id, armedButtonB64: null }
+  }
+  return { itemId: null, armedButtonB64: null }
+}
+
+function renderQueuePanel(): void {
+  const listEl = el<HTMLUListElement>('queue-list')
+  const emptyEl = el('queue-empty')
+  const tabCount = el('tab-count-queue')
+  if (!listEl || !emptyEl) return
+
+  if (tabCount) tabCount.textContent = String(lastItems.length)
+  emptyEl.hidden = lastItems.length > 0
+
+  const { itemId: focusedId, armedButtonB64 } = activeFocusedInfo()
+  const now = Date.now()
+  const queueKey = JSON.stringify({
+    focusedId,
+    armedButtonB64,
+    items: lastItems.map((i) => [i.id, i.line, formatRelativeAge(i.sentAt, now), i.buttons.length]),
+  })
+  if (queueKey === lastQueueKey) return
+  lastQueueKey = queueKey
+
+  listEl.replaceChildren(
+    ...lastItems.map((item, idx) => {
+      const li = document.createElement('li')
+      const isFocused = item.id === focusedId
+      const isArmed = isFocused && armedButtonB64 !== null
+      li.className = 'queue-row'
+      li.dataset.focused = String(isFocused)
+      li.dataset.armed = String(isArmed)
+
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'queue-row-btn'
+      btn.addEventListener('click', () => {
+        dispatch({ type: 'FOCUS_ITEM', index: idx, openButtons: true })
+      })
+
+      const head = document.createElement('div')
+      head.className = 'queue-row-head'
+
+      const botSpan = document.createElement('span')
+      botSpan.className = 'queue-bot'
+      botSpan.textContent = `@${item.bot}`
+
+      const ageSpan = document.createElement('span')
+      ageSpan.className = 'queue-age'
+      ageSpan.textContent = formatRelativeAge(item.sentAt, now)
+
+      head.append(botSpan, ageSpan)
+
+      const lineP = document.createElement('p')
+      lineP.className = 'queue-line'
+      lineP.textContent = item.line
+
+      const signals = document.createElement('div')
+      signals.className = 'queue-signals'
+
+      for (const cb of item.buttons) {
+        const tag = document.createElement('span')
+        const thisArmed = isArmed && cb.dataB64 === armedButtonB64
+        tag.className = thisArmed
+          ? 'signal-tag signal-tag--armed'
+          : cb.requiresPassword
+            ? 'signal-tag signal-tag--blocked'
+            : cb.danger
+              ? 'signal-tag signal-tag--danger'
+              : 'signal-tag'
+        tag.textContent = thisArmed
+          ? `${cb.label}: Press again`
+          : cb.requiresPassword
+            ? `${cb.label} (2FA blocked)`
+            : cb.danger
+              ? `${cb.label} (2x tap)`
+              : cb.label
+        signals.append(tag)
+      }
+
+      if (item.hiddenNonCallbackCount > 0) {
+        const stripped = document.createElement('span')
+        stripped.className = 'signal-tag signal-tag--stripped'
+        stripped.textContent = `${item.hiddenNonCallbackCount} non-callback stripped`
+        signals.append(stripped)
+      }
+
+      btn.append(head, lineP, signals)
+      li.append(btn)
+      return li
+    }),
+  )
+}
+
+function renderAllowlistPanel(): void {
+  const rowsEl = el<HTMLUListElement>('allowlist-rows')
+  const tabCount = el('tab-count-allowlist')
+  const modeNote = el('mode-note')
+  const resetBtn = el<HTMLButtonElement>('btn-demo-reset')
+  if (!rowsEl) return
+
+  const allowlist = lastStatus?.allowlist ?? []
+  if (tabCount) tabCount.textContent = String(allowlist.length)
+  if (resetBtn) resetBtn.hidden = lastStatus?.mode !== 'demo'
+
+  const allowKey = `${lastStatus?.mode ?? ''}|${lastStatus?.pairing.status ?? ''}|${allowlist.join(',')}`
+  if (allowKey === lastAllowlistKey) return
+  lastAllowlistKey = allowKey
+
+  if (modeNote) {
+    modeNote.textContent =
+      lastStatus?.mode === 'demo'
+        ? 'Offline sandbox fixtures active'
+        : lastStatus?.pairing.status === 'paired'
+          ? 'Live MTProto Layer 234'
+          : ''
+  }
+
+  rowsEl.replaceChildren(
+    ...allowlist.map((bot) => {
+      const li = document.createElement('li')
+      li.className = 'allowlist-item'
+
+      const handle = document.createElement('span')
+      handle.className = 'allowlist-handle'
+      handle.textContent = `@${bot}`
+
+      const rm = document.createElement('button')
+      rm.type = 'button'
+      rm.className = 'key key--quiet'
+      rm.textContent = 'Remove'
+      rm.addEventListener('click', async () => {
+        await client.removeAllowlist(bot)
+        await refreshFromGateway()
+      })
+
+      li.append(handle, rm)
+      return li
+    }),
+  )
+}
+
+function renderAuditPanel(): void {
+  const tbody = el<HTMLTableSectionElement>('audit-rows')
+  const emptyEl = el('audit-empty')
+  const tabCount = el('tab-count-audit')
+  if (!tbody || !emptyEl) return
+
+  const entries = lastStatus?.recentAudit.slice(0, 12) ?? []
+  if (tabCount) tabCount.textContent = String(entries.length)
+  emptyEl.hidden = entries.length > 0
+
+  const auditKey = entries.map((e) => `${e.id}:${e.outcome}`).join('|')
+  if (auditKey === lastAuditKey) return
+  lastAuditKey = auditKey
+
+  tbody.replaceChildren(
+    ...entries.map((entry) => {
+      const tr = document.createElement('tr')
+
+      const tdAction = document.createElement('td')
+      const botSpan = document.createElement('span')
+      botSpan.className = 'audit-bot'
+      botSpan.textContent = `@${entry.bot}`
+      const lblSpan = document.createElement('span')
+      lblSpan.className = 'audit-label'
+      lblSpan.textContent = entry.buttonLabel
+      tdAction.append(botSpan, lblSpan)
+
+      const tdStatus = document.createElement('td')
+      const stSpan = document.createElement('span')
+      stSpan.className = 'audit-status'
+      stSpan.dataset.outcome = entry.outcome
+      stSpan.textContent = entry.outcome.replace(/_/g, ' ')
+      tdStatus.append(stSpan)
+
+      tr.append(tdAction, tdStatus)
+      return tr
+    }),
+  )
+}
+
+function renderPairingModalState(): void {
+  const statusText = el('pairing-status-text')
+  const controls = el('pairing-controls')
+  const feedback = el('pairing-feedback')
+  const demoDetails = el('demo-env-details')
+  if (!statusText || !controls) return
+
+  const pairing = lastStatus?.pairing
+  if (!pairing) {
+    statusText.textContent = 'Gateway unreachable. Test or update the endpoint URL above.'
+    if (demoDetails) demoDetails.hidden = true
+    controls.replaceChildren()
+    return
+  }
+
+  if (pairing.mode === 'demo') {
+    statusText.textContent = 'Connected to offline Demo Sandbox fixtures.'
+    if (demoDetails) demoDetails.hidden = false
+    controls.replaceChildren()
+    return
+  }
+
+  if (demoDetails) demoDetails.hidden = true
+  statusText.textContent =
+    pairing.status === 'paired'
+      ? `Paired as ${pairing.accountLabel || 'authorized account'}. Session stays on your gateway.`
+      : `Live MTProto gateway (${pairing.status}). Session stays local to your gateway.`
+
+  if (controls.contains(document.activeElement) && document.activeElement?.tagName === 'INPUT') {
+    return
+  }
+
+  const nodes: HTMLElement[] = []
+
+  const row = document.createElement('div')
+  row.className = 'dialog-row'
+
+  const qrBtn = document.createElement('button')
+  qrBtn.type = 'button'
+  qrBtn.className = 'key key--primary'
+  qrBtn.textContent = 'Start QR pairing'
+  qrBtn.addEventListener('click', async () => {
+    try {
+      const res = await client.startQrPairing()
+      if (feedback) feedback.textContent = res.pairing.error || 'Waiting for Telegram QR scan…'
+      await refreshFromGateway()
+      if (qrPollTimer) window.clearInterval(qrPollTimer)
+      qrPollTimer = window.setInterval(async () => {
+        const polled = await client.pollQrPairing()
+        if (polled.pairing.status === 'paired' && qrPollTimer) {
+          window.clearInterval(qrPollTimer)
+          qrPollTimer = null
+          if (feedback) feedback.textContent = 'Paired.'
+        }
+        await refreshFromGateway()
+      }, 3000)
+    } catch (err) {
+      if (feedback) feedback.textContent = err instanceof Error ? err.message : 'QR pairing failed'
+    }
+  })
+  row.append(qrBtn)
+
+  if (pairing.status === 'paired') {
+    const signOut = document.createElement('button')
+    signOut.type = 'button'
+    signOut.className = 'key'
+    signOut.textContent = 'Sign out'
+    signOut.addEventListener('click', async () => {
+      await client.disconnect()
+      if (feedback) feedback.textContent = 'Session cleared on gateway.'
+      await refreshFromGateway()
+    })
+    row.append(signOut)
+  }
+  nodes.push(row)
+
+  if (pairing.qrUrl) {
+    const qrBox = document.createElement('div')
+    qrBox.className = 'qr-readout'
+    qrBox.textContent = pairing.qrUrl
+    nodes.push(qrBox)
+  }
+
+  if (pairing.status === 'unpaired') {
+    const f = document.createElement('form')
+    f.className = 'inline-form'
+    const inp = document.createElement('input')
+    inp.className = 'field'
+    inp.type = 'tel'
+    inp.placeholder = '+628…'
+    inp.ariaLabel = 'Phone number'
+    const btn = document.createElement('button')
+    btn.type = 'submit'
+    btn.className = 'key'
+    btn.textContent = 'Send code'
+    f.append(inp, btn)
+    f.addEventListener('submit', async (ev) => {
+      ev.preventDefault()
+      if (!inp.value.trim()) return
+      try {
+        await client.startPhonePairing(inp.value.trim())
+        if (feedback) feedback.textContent = 'Code sent to your Telegram app.'
+        await refreshFromGateway()
+      } catch (err) {
+        if (feedback) feedback.textContent = err instanceof Error ? err.message : 'Send code failed'
+      }
+    })
+    nodes.push(f)
+  }
+
+  if (pairing.status === 'awaiting_code') {
+    const f = document.createElement('form')
+    f.className = 'inline-form'
+    const inp = document.createElement('input')
+    inp.className = 'field'
+    inp.type = 'text'
+    inp.placeholder = `Login code (${pairing.phoneMask ?? ''})`
+    inp.ariaLabel = 'Telegram login code'
+    const btn = document.createElement('button')
+    btn.type = 'submit'
+    btn.className = 'key key--primary'
+    btn.textContent = 'Verify code'
+    f.append(inp, btn)
+    f.addEventListener('submit', async (ev) => {
+      ev.preventDefault()
+      if (!inp.value.trim()) return
+      try {
+        await client.submitPhoneCode(inp.value.trim())
+        if (feedback) feedback.textContent = ''
+        await refreshFromGateway()
+      } catch (err) {
+        if (feedback) feedback.textContent = err instanceof Error ? err.message : 'Verification failed'
+      }
+    })
+    nodes.push(f)
+  }
+
+  if (pairing.status === 'awaiting_2fa') {
+    const f = document.createElement('form')
+    f.className = 'inline-form'
+    const inp = document.createElement('input')
+    inp.className = 'field'
+    inp.type = 'password'
+    inp.placeholder = 'Telegram 2FA password'
+    inp.ariaLabel = 'Telegram 2FA cloud password'
+    const btn = document.createElement('button')
+    btn.type = 'submit'
+    btn.className = 'key key--primary'
+    btn.textContent = 'Unlock'
+    f.append(inp, btn)
+    f.addEventListener('submit', async (ev) => {
+      ev.preventDefault()
+      if (!inp.value) return
+      try {
+        await client.submit2FA(inp.value)
+        if (feedback) feedback.textContent = ''
+        await refreshFromGateway()
+      } catch (err) {
+        if (feedback) feedback.textContent = err instanceof Error ? err.message : '2FA unlock failed'
+      }
+    })
+    nodes.push(f)
+  }
+
+  controls.replaceChildren(...nodes)
+}
+
+function syncUI(): void {
   const frame = renderG2Frame(g2State, Date.now())
   pushFrameToG2(frame)
-  renderCompanionShell(frame)
+  updateHardwareStateChrome()
+  renderTopStatus()
+  renderQueuePanel()
+  renderAllowlistPanel()
+  renderAuditPanel()
+  renderPairingModalState()
 }
 
 function dispatch(action: G2Action): void {
   const { state, effect } = reduceG2State(g2State, action, lastMeta)
   g2State = state
-  renderAll()
+  syncUI()
 
   if (!effect) return
   if (effect.type === 'SHUTDOWN_G2') {
@@ -141,6 +618,7 @@ async function refreshFromGateway(): Promise<void> {
   try {
     const [status, pending] = await Promise.all([client.getStatus(), client.getPending()])
     lastStatus = status
+    lastItems = pending.items
     lastMeta = {
       allowlistCount: status.allowlist.length,
       mode: status.mode,
@@ -154,11 +632,212 @@ async function refreshFromGateway(): Promise<void> {
     })
   } catch (err) {
     lastStatus = null
+    lastItems = []
     dispatch({
       type: 'SYNC_ERROR',
       message: err instanceof Error ? err.message : 'Gateway unreachable',
     })
   }
+}
+
+// Accessible tabs (selection follows focus, focusgroupstart sync, beforematch for hidden="until-found")
+function setupTabs(): void {
+  const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('#tablist [role="tab"]'))
+  const panelMap: Record<string, HTMLElement | null> = {
+    'tab-queue': el('panel-queue'),
+    'tab-allowlist': el('panel-allowlist'),
+    'tab-audit': el('panel-audit'),
+  }
+
+  const selectTab = (target: HTMLButtonElement) => {
+    for (const tab of tabs) {
+      const selected = tab === target
+      tab.setAttribute('aria-selected', String(selected))
+      tab.toggleAttribute('focusgroupstart', selected)
+      const panel = panelMap[tab.id]
+      if (panel) {
+        if (selected) {
+          panel.removeAttribute('hidden')
+          panel.setAttribute('tabindex', '0')
+        } else {
+          panel.setAttribute('hidden', 'until-found')
+          panel.removeAttribute('tabindex')
+        }
+      }
+    }
+    target.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }
+
+  for (const tab of tabs) {
+    tab.addEventListener('click', () => selectTab(tab))
+    tab.addEventListener('keydown', (ev) => {
+      const idx = tabs.indexOf(tab)
+      if (ev.key === 'ArrowRight') {
+        ev.preventDefault()
+        const next = tabs[(idx + 1) % tabs.length]!
+        next.focus()
+        selectTab(next)
+      } else if (ev.key === 'ArrowLeft') {
+        ev.preventDefault()
+        const prev = tabs[(idx - 1 + tabs.length) % tabs.length]!
+        prev.focus()
+        selectTab(prev)
+      }
+    })
+  }
+
+  for (const [tabId, panel] of Object.entries(panelMap)) {
+    panel?.addEventListener('beforematch', () => {
+      const t = tabs.find((x) => x.id === tabId)
+      if (t) selectTab(t)
+    })
+  }
+}
+
+// Native modal <dialog> wiring (modern-web-guidance: showModal, reset returnValue, closedby fallback)
+function setupGatewayDialog(): void {
+  const dialog = el<HTMLDialogElement>('gateway-dialog')
+  const openBtn = el('btn-open-gateway')
+  const closeBtn = el('btn-close-gateway')
+  const testBtn = el('btn-test-gateway')
+  const pingOut = el<HTMLOutputElement>('gateway-ping')
+  const urlInput = el<HTMLInputElement>('input-url')
+  const tokenInput = el<HTMLInputElement>('input-token')
+  if (!dialog) return
+
+  const syncInputs = () => {
+    const cfg = client.getConfig()
+    if (urlInput) urlInput.value = cfg.baseUrl
+    if (tokenInput) tokenInput.value = cfg.token ?? ''
+    if (pingOut) {
+      pingOut.textContent = ''
+      pingOut.removeAttribute('data-ok')
+    }
+  }
+
+  openBtn?.addEventListener('click', () => {
+    syncInputs()
+    dialog.showModal()
+  })
+
+  closeBtn?.addEventListener('click', () => {
+    dialog.close('close')
+  })
+
+  dialog.addEventListener('close', () => {
+    dialog.returnValue = ''
+  })
+
+  testBtn?.addEventListener('click', async () => {
+    const base = (urlInput?.value.trim() || client.getConfig().baseUrl).replace(/\/+$/, '')
+    const t0 = performance.now()
+    if (pingOut) {
+      pingOut.textContent = 'testing…'
+      pingOut.removeAttribute('data-ok')
+    }
+    try {
+      const res = await fetch(`${base}/health`)
+      const ms = Math.round(performance.now() - t0)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const body = (await res.json()) as { mode?: string }
+      if (pingOut) {
+        pingOut.dataset.ok = 'true'
+        pingOut.textContent = `ok (${body.mode ?? 'live'}, ${ms}ms)`
+      }
+    } catch (err) {
+      if (pingOut) {
+        pingOut.dataset.ok = 'false'
+        pingOut.textContent = err instanceof Error ? err.message : 'unreachable'
+      }
+    }
+  })
+
+  // Graceful light-dismiss fallback when browser lacks native closedby="any"
+  if (!('closedBy' in HTMLDialogElement.prototype)) {
+    const outside = (e: PointerEvent) => {
+      const r = dialog.getBoundingClientRect()
+      return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom
+    }
+    let pressedOutside = false
+    dialog.addEventListener('pointerdown', (e) => {
+      pressedOutside = outside(e)
+    })
+    dialog.addEventListener('pointerup', (e) => {
+      if (pressedOutside && outside(e)) dialog.close('backdrop')
+    })
+  }
+
+  el('form-gateway')?.addEventListener('submit', (ev) => {
+    ev.preventDefault()
+    const url = urlInput?.value.trim()
+    const tok = tokenInput?.value.trim() ?? ''
+    if (!url) return
+    window.localStorage.setItem(STORAGE_URL_KEY, url)
+    window.localStorage.setItem(STORAGE_TOKEN_KEY, tok)
+    client.configure({ baseUrl: url, token: tok })
+    dialog.close('saved')
+    void refreshFromGateway()
+  })
+}
+
+function setupControls(): void {
+  el('ring-up')?.addEventListener('click', () => dispatch({ type: 'SCROLL_UP' }))
+  el('ring-down')?.addEventListener('click', () => dispatch({ type: 'SCROLL_DOWN' }))
+  el('ring-tap')?.addEventListener('click', () => dispatch({ type: 'TAP', now: Date.now() }))
+  el('ring-double')?.addEventListener('click', () => dispatch({ type: 'DOUBLE_TAP' }))
+  el('btn-sync')?.addEventListener('click', () => void refreshFromGateway())
+
+  el('btn-demo-reset')?.addEventListener('click', async () => {
+    await client.resetDemo()
+    await refreshFromGateway()
+  })
+
+  el('form-allowlist')?.addEventListener('submit', async (ev) => {
+    ev.preventDefault()
+    const input = el<HTMLInputElement>('input-bot')
+    const hint = el('allowlist-hint')
+    const val = input?.value.trim()
+    if (!val) return
+    try {
+      await client.addAllowlist(val)
+      if (input) input.value = ''
+      if (hint) {
+        hint.dataset.error = 'false'
+        hint.textContent = 'Bot added to allowlist.'
+      }
+      await refreshFromGateway()
+    } catch (err) {
+      if (hint) {
+        hint.dataset.error = 'true'
+        hint.textContent = err instanceof Error ? err.message : 'Invalid bot handle'
+      }
+    }
+  })
+
+  window.addEventListener('keydown', (ev) => {
+    const dialog = el<HTMLDialogElement>('gateway-dialog')
+    if (dialog?.open) return
+    if (
+      ev.target instanceof HTMLInputElement ||
+      ev.target instanceof HTMLTextAreaElement ||
+      (ev.target instanceof HTMLElement && ev.target.closest('#tablist'))
+    ) {
+      return
+    }
+    if (ev.key === 'ArrowUp') {
+      ev.preventDefault()
+      dispatch({ type: 'SCROLL_UP' })
+    } else if (ev.key === 'ArrowDown') {
+      ev.preventDefault()
+      dispatch({ type: 'SCROLL_DOWN' })
+    } else if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault()
+      dispatch({ type: 'TAP', now: Date.now() })
+    } else if (ev.key === 'Escape' || ev.key === 'Backspace') {
+      ev.preventDefault()
+      dispatch({ type: 'DOUBLE_TAP' })
+    }
+  })
 }
 
 async function initEvenBridge(): Promise<void> {
@@ -209,7 +888,7 @@ async function initEvenBridge(): Promise<void> {
 
     if (res === 0) {
       bridgeReady = true
-      lastRenderedKey = `${initialFrame.body}\u0000${initialFrame.footer}`
+      lastRenderedLensKey = `${initialFrame.body}\u0000${initialFrame.footer}`
     }
 
     const unsubscribe = bridge.onEvenHubEvent((event) => {
@@ -246,304 +925,15 @@ async function initEvenBridge(): Promise<void> {
 
     window.addEventListener('beforeunload', () => unsubscribe())
   } catch (err) {
-    console.warn('[bottap] Even Hub bridge not active (running in standalone browser preview):', err)
+    console.warn('[bottap] Even Hub bridge not active (standalone browser mode):', err)
   }
 }
 
-function renderCompanionShell(frame: G2Frame): void {
-  const root = document.getElementById('app')
-  if (!root) return
-
-  const cfg = client.getConfig()
-  const pillClass = !lastStatus
-    ? 'offline'
-    : lastStatus.mode === 'demo'
-      ? 'demo'
-      : lastStatus.pairing.status === 'paired'
-        ? 'live'
-        : 'offline'
-
-  const pillText = !lastStatus
-    ? 'OFFLINE'
-    : lastStatus.mode === 'demo'
-      ? `DEMO · ${lastStatus.pendingCount} PENDING`
-      : lastStatus.pairing.status === 'paired'
-        ? `LIVE · ${lastStatus.pendingCount} PENDING`
-        : 'UNPAIRED'
-
-  const allowlist = lastStatus?.allowlist ?? []
-  const audit = lastStatus?.recentAudit.slice(0, 6) ?? []
-  const pairing = lastStatus?.pairing
-
-  root.innerHTML = `
-    <main class="shell">
-      <header class="topbar">
-        <div class="brand">
-          <div class="brand-row">
-            <span class="brand-name">BOTTAP</span>
-          </div>
-          <span class="brand-sub">On-duty bot button deck · Even G2 + R1 Ring</span>
-        </div>
-        <span class="pill ${pillClass}"><span class="dot"></span>${escapeHtml(pillText)}</span>
-      </header>
-
-      <section class="card" aria-label="G2 Waveguide Display Mirror">
-        <div class="card-head">
-          <span class="card-title">G2 Optical Display (576×288 Mono)</span>
-          <button id="btn-refresh" class="small" type="button">Sync</button>
-        </div>
-        <div class="lens-frame">
-          <pre id="lens-body" class="lens-body">${escapeHtml(frame.body)}</pre>
-          <div id="lens-footer" class="lens-footer">${escapeHtml(frame.footer)}</div>
-        </div>
-        <div class="ring-controls" aria-label="R1 Ring Controls">
-          <button id="ring-up" type="button">Swipe Up</button>
-          <button id="ring-tap" class="primary" type="button">Tap</button>
-          <button id="ring-down" type="button">Swipe Down</button>
-          <button id="ring-double" type="button">2x Tap</button>
-        </div>
-      </section>
-
-      <section class="card" aria-label="Allowlisted Bots">
-        <div class="card-head">
-          <span class="card-title">Allowlisted Bots (${allowlist.length})</span>
-          ${
-            lastStatus?.mode === 'demo'
-              ? '<button id="btn-demo-reset" class="small danger-btn" type="button">Reset Demo</button>'
-              : ''
-          }
-        </div>
-        <div class="chips">
-          ${
-            allowlist.length
-              ? allowlist
-                  .map(
-                    (bot) =>
-                      `<span class="chip">@${escapeHtml(bot)}<button data-remove-bot="${escapeHtml(bot)}" title="Remove" type="button">×</button></span>`,
-                  )
-                  .join('')
-              : '<span class="hint">No bots allowlisted yet. Add a bot handle below.</span>'
-          }
-        </div>
-        <form id="form-allowlist" class="row">
-          <input id="input-bot" type="text" placeholder="@uptime_ops_bot" autocomplete="off" />
-          <button type="submit">Add Bot</button>
-        </form>
-        <p class="hint">Only inline callback buttons from allowlisted bots appear on glasses. URL, Mini App, and 2FA buttons are blocked at the gateway.</p>
-      </section>
-
-      <section class="card" aria-label="Self-Hosted Gateway Pairing">
-        <div class="card-head">
-          <span class="card-title">Self-Hosted Gateway</span>
-          <span class="hint">${escapeHtml(pairing?.accountLabel || pairing?.status || 'disconnected')}</span>
-        </div>
-        <form id="form-gateway" class="row">
-          <input id="input-url" type="url" value="${escapeHtml(cfg.baseUrl)}" placeholder="http://127.0.0.1:8788" />
-          <input id="input-token" type="password" value="${escapeHtml(cfg.token ?? '')}" placeholder="Bearer token (optional)" />
-          <button type="submit">Save</button>
-        </form>
-        ${
-          pairing?.mode === 'live'
-            ? `
-          <div class="row">
-            <button id="btn-qr" class="primary" type="button">Start QR Pairing</button>
-            ${
-              pairing.status === 'paired'
-                ? '<button id="btn-disconnect" class="danger-btn" type="button">Sign Out</button>'
-                : ''
-            }
-          </div>
-          ${
-            pairing.qrUrl
-              ? `<div class="qr-box">Scan or open on Telegram mobile:<br/>${escapeHtml(pairing.qrUrl)}</div>`
-              : ''
-          }
-          ${
-            pairing.status === 'unpaired'
-              ? `<form id="form-phone" class="row"><input id="input-phone" type="tel" placeholder="+628..." /><button type="submit">Send Code</button></form>`
-              : ''
-          }
-          ${
-            pairing.status === 'awaiting_code'
-              ? `<form id="form-code" class="row"><input id="input-code" type="text" placeholder="Login code (${escapeHtml(pairing.phoneMask ?? '')})" /><button type="submit">Verify Code</button></form>`
-              : ''
-          }
-          ${
-            pairing.status === 'awaiting_2fa'
-              ? `<form id="form-2fa" class="row"><input id="input-2fa" type="password" placeholder="Telegram 2FA cloud password" /><button type="submit">Unlock</button></form>`
-              : ''
-          }
-        `
-            : '<p class="hint">Running offline Demo Sandbox fixtures. Switch gateway to live MTProto mode with TG_API_ID + TG_API_HASH to pair a real account.</p>'
-        }
-        ${pairingMessage ? `<p class="hint">${escapeHtml(pairingMessage)}</p>` : ''}
-      </section>
-
-      <section class="card" aria-label="Press Audit Log">
-        <div class="card-head">
-          <span class="card-title">Recent Press Audit (${audit.length})</span>
-        </div>
-        <div class="audit-list">
-          ${
-            audit.length
-              ? audit
-                  .map(
-                    (a) => `
-                  <div class="audit-row">
-                    <span>@${escapeHtml(a.bot)} · ${escapeHtml(a.buttonLabel)}</span>
-                    <span class="audit-outcome ${escapeHtml(a.outcome)}">${escapeHtml(a.outcome.replace(/_/g, ' '))}</span>
-                  </div>`,
-                  )
-                  .join('')
-              : '<span class="hint">No button presses recorded yet.</span>'
-          }
-        </div>
-      </section>
-
-      <footer class="footer-tos">
-        BotTap is an unofficial Telegram API client running strictly against your own self-hosted gateway.
-        MTProto sessions never leave your machine. No chat lists, no message bodies, no free-text sending, and no AI training on Telegram data.
-      </footer>
-    </main>
-  `
-
-  document.getElementById('ring-up')?.addEventListener('click', () => dispatch({ type: 'SCROLL_UP' }))
-  document.getElementById('ring-down')?.addEventListener('click', () => dispatch({ type: 'SCROLL_DOWN' }))
-  document.getElementById('ring-tap')?.addEventListener('click', () => dispatch({ type: 'TAP', now: Date.now() }))
-  document.getElementById('ring-double')?.addEventListener('click', () => dispatch({ type: 'DOUBLE_TAP' }))
-  document.getElementById('btn-refresh')?.addEventListener('click', () => void refreshFromGateway())
-
-  document.getElementById('btn-demo-reset')?.addEventListener('click', async () => {
-    await client.resetDemo()
-    await refreshFromGateway()
-  })
-
-  document.querySelectorAll<HTMLButtonElement>('[data-remove-bot]').forEach((el) => {
-    el.addEventListener('click', async () => {
-      const bot = el.dataset.removeBot
-      if (!bot) return
-      await client.removeAllowlist(bot)
-      await refreshFromGateway()
-    })
-  })
-
-  document.getElementById('form-allowlist')?.addEventListener('submit', async (ev) => {
-    ev.preventDefault()
-    const input = document.getElementById('input-bot') as HTMLInputElement | null
-    const val = input?.value.trim()
-    if (!val) return
-    try {
-      await client.addAllowlist(val)
-      if (input) input.value = ''
-      pairingMessage = ''
-      await refreshFromGateway()
-    } catch (err) {
-      pairingMessage = err instanceof Error ? err.message : 'Invalid bot handle'
-      renderAll()
-    }
-  })
-
-  document.getElementById('form-gateway')?.addEventListener('submit', (ev) => {
-    ev.preventDefault()
-    const url = (document.getElementById('input-url') as HTMLInputElement | null)?.value.trim()
-    const tok = (document.getElementById('input-token') as HTMLInputElement | null)?.value.trim() ?? ''
-    if (!url) return
-    window.localStorage.setItem(STORAGE_URL_KEY, url)
-    window.localStorage.setItem(STORAGE_TOKEN_KEY, tok)
-    client.configure({ baseUrl: url, token: tok })
-    void refreshFromGateway()
-  })
-
-  document.getElementById('btn-qr')?.addEventListener('click', async () => {
-    try {
-      const res = await client.startQrPairing()
-      pairingMessage = res.pairing.error || 'Waiting for Telegram QR confirmation...'
-      await refreshFromGateway()
-      if (qrPollTimer) window.clearInterval(qrPollTimer)
-      qrPollTimer = window.setInterval(async () => {
-        const polled = await client.pollQrPairing()
-        if (polled.pairing.status === 'paired' && qrPollTimer) {
-          window.clearInterval(qrPollTimer)
-          qrPollTimer = null
-          pairingMessage = 'Paired.'
-        }
-        await refreshFromGateway()
-      }, 3000)
-    } catch (err) {
-      pairingMessage = err instanceof Error ? err.message : 'QR pairing failed'
-      renderAll()
-    }
-  })
-
-  document.getElementById('btn-disconnect')?.addEventListener('click', async () => {
-    await client.disconnect()
-    pairingMessage = 'Session cleared on gateway.'
-    await refreshFromGateway()
-  })
-
-  document.getElementById('form-phone')?.addEventListener('submit', async (ev) => {
-    ev.preventDefault()
-    const phone = (document.getElementById('input-phone') as HTMLInputElement | null)?.value.trim()
-    if (!phone) return
-    try {
-      await client.startPhonePairing(phone)
-      pairingMessage = 'Code sent to your Telegram app.'
-      await refreshFromGateway()
-    } catch (err) {
-      pairingMessage = err instanceof Error ? err.message : 'Send code failed'
-      renderAll()
-    }
-  })
-
-  document.getElementById('form-code')?.addEventListener('submit', async (ev) => {
-    ev.preventDefault()
-    const code = (document.getElementById('input-code') as HTMLInputElement | null)?.value.trim()
-    if (!code) return
-    try {
-      await client.submitPhoneCode(code)
-      pairingMessage = ''
-      await refreshFromGateway()
-    } catch (err) {
-      pairingMessage = err instanceof Error ? err.message : 'Code verification failed'
-      renderAll()
-    }
-  })
-
-  document.getElementById('form-2fa')?.addEventListener('submit', async (ev) => {
-    ev.preventDefault()
-    const pw = (document.getElementById('input-2fa') as HTMLInputElement | null)?.value
-    if (!pw) return
-    try {
-      await client.submit2FA(pw)
-      pairingMessage = ''
-      await refreshFromGateway()
-    } catch (err) {
-      pairingMessage = err instanceof Error ? err.message : '2FA unlock failed'
-      renderAll()
-    }
-  })
-}
-
-// Keyboard shortcuts for fast desktop/simulator testing (mirrors R1 ring)
-window.addEventListener('keydown', (ev) => {
-  if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLTextAreaElement) return
-  if (ev.key === 'ArrowUp') {
-    ev.preventDefault()
-    dispatch({ type: 'SCROLL_UP' })
-  } else if (ev.key === 'ArrowDown') {
-    ev.preventDefault()
-    dispatch({ type: 'SCROLL_DOWN' })
-  } else if (ev.key === 'Enter' || ev.key === ' ') {
-    ev.preventDefault()
-    dispatch({ type: 'TAP', now: Date.now() })
-  } else if (ev.key === 'Escape' || ev.key === 'Backspace') {
-    ev.preventDefault()
-    dispatch({ type: 'DOUBLE_TAP' })
-  }
-})
-
-// Boot sequence
-renderAll()
+setupFramebufferScale()
+setupTabs()
+setupGatewayDialog()
+setupControls()
+syncUI()
 void initEvenBridge()
 void refreshFromGateway()
 

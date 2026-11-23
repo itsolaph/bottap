@@ -6,10 +6,215 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no"
     />
-    <title>BotTap — On-Duty Bot Button Deck</title>
+    <meta
+      name="description"
+      content="BotTap on-duty bot button deck for Even Realities G2 smart glasses and R1 ring, backed by a self-hosted unofficial Telegram MTProto gateway."
+    />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23161a21'/%3E%3Crect x='5' y='9' width='22' height='14' rx='2' fill='%230c1910' stroke='%2359e28f' stroke-width='2'/%3E%3Ccircle cx='12' cy='16' r='2.5' fill='%2359e28f'/%3E%3Crect x='17' y='14.5' width='7' height='3' rx='1' fill='%2359e28f'/%3E%3C/svg%3E"
+    />
+    <title>BotTap: Even G2 Bot Button Deck</title>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="page-root" class="page" data-arm="idle">
+      <header class="topbar">
+        <div class="wordmark-group">
+          <h1 class="wordmark">BotTap</h1>
+          <span class="wordmark-meta">On-duty bot button deck for Even G2</span>
+        </div>
+        <div class="topbar-actions">
+          <span id="status-readout" class="status-readout" role="status" data-state="offline">
+            <svg class="status-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <circle cx="8" cy="8" r="5" stroke="currentColor" stroke-width="1.75" />
+              <circle cx="8" cy="8" r="2" fill="currentColor" />
+            </svg>
+            <span id="status-label">Connecting</span>
+          </span>
+          <button id="btn-open-gateway" class="key key--quiet" type="button">Gateway</button>
+        </div>
+      </header>
+
+      <main class="workbench">
+        <section class="stage" aria-label="Even G2 optical instrument">
+          <div class="g2-chassis">
+            <div class="g2-chassis-bar">
+              <span class="g2-spec">G2 lens mirror</span>
+              <span class="g2-dim">576×288 4-bit green</span>
+            </div>
+            <div id="g2-viewport" class="g2-viewport">
+              <div id="g2-framebuffer" class="g2-framebuffer">
+                <pre id="lens-body" class="g2-lens-body">BOTTAP · ON-DUTY
+
+Connecting to self-hosted gateway…</pre>
+                <div id="lens-footer" class="g2-lens-footer">2x tap: exit</div>
+              </div>
+            </div>
+            <div class="flow-ruler" aria-label="Optical deck state">
+              <span id="step-queue" class="flow-step" data-active="true">1 Queue</span>
+              <span id="step-buttons" class="flow-step" data-active="false">2 Buttons</span>
+              <span id="step-gate" class="flow-step" data-active="false">3 Safety gate</span>
+              <span id="step-result" class="flow-step" data-active="false">4 Result</span>
+            </div>
+          </div>
+
+          <div id="arm-strip" class="arm-strip" hidden>
+            <span id="arm-strip-label">Destructive action armed</span>
+            <span>Back cancels</span>
+          </div>
+
+          <div class="ring-tray" role="group" aria-label="R1 Ring controls">
+            <button id="ring-up" class="key" type="button">
+              <span>Up</span>
+              <span class="key-kbd" aria-hidden="true">↑</span>
+            </button>
+            <button id="ring-tap" class="key key--primary key--tap" type="button">
+              <span id="ring-tap-label">Tap</span>
+              <span class="key-kbd" aria-hidden="true">Enter</span>
+            </button>
+            <button id="ring-down" class="key" type="button">
+              <span>Down</span>
+              <span class="key-kbd" aria-hidden="true">↓</span>
+            </button>
+            <button id="ring-double" class="key" type="button">
+              <span>Back</span>
+              <span class="key-kbd" aria-hidden="true">Esc</span>
+            </button>
+          </div>
+          <p class="ring-caption">Mirrors the R1 ring and temple touchpad. Keyboard: arrows, Enter, Esc.</p>
+        </section>
+
+        <aside class="inspector" aria-label="Companion deck inspector">
+          <div class="inspector-bar">
+            <div id="tablist" class="tablist" role="tablist" focusgroup="tablist nomemory" aria-label="Deck views">
+              <button id="tab-queue" class="tab-btn" type="button" role="tab" aria-selected="true" focusgroupstart>
+                <span>Queue</span>
+                <span id="tab-count-queue" class="tab-count">0</span>
+              </button>
+              <button id="tab-allowlist" class="tab-btn" type="button" role="tab" aria-selected="false">
+                <span>Allowlist</span>
+                <span id="tab-count-allowlist" class="tab-count">0</span>
+              </button>
+              <button id="tab-audit" class="tab-btn" type="button" role="tab" aria-selected="false">
+                <span>Audit</span>
+                <span id="tab-count-audit" class="tab-count">0</span>
+              </button>
+            </div>
+            <button id="btn-sync" class="key key--quiet" type="button">Sync</button>
+          </div>
+
+          <div class="panels-stack">
+            <div id="panel-queue" role="tabpanel" aria-labelledby="tab-queue" tabindex="0">
+              <div class="panel-body">
+                <ul id="queue-list" class="queue-list"></ul>
+                <p id="queue-empty" class="empty-note">Waiting for allowlisted bots with inline callback buttons.</p>
+                <div class="policy-strip" aria-label="Protocol safety boundaries">
+                  <div class="policy-item">
+                    <span class="policy-term">Double-press on danger</span>
+                    <span class="policy-desc">Buttons marked destructive arm first and auto-cancel after 6 seconds.</span>
+                  </div>
+                  <div class="policy-item">
+                    <span class="policy-term">2FA blocked on glasses</span>
+                    <span class="policy-desc">Password-gated callbacks refuse on G2 and stay inside Telegram.</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div id="panel-allowlist" role="tabpanel" aria-labelledby="tab-allowlist" hidden="until-found">
+              <div class="panel-body">
+                <form id="form-allowlist" class="inline-form">
+                  <input
+                    id="input-bot"
+                    class="field"
+                    type="text"
+                    placeholder="@uptime_ops_bot"
+                    aria-label="Bot username"
+                    autocomplete="off"
+                  />
+                  <button class="key" type="submit">Add</button>
+                </form>
+                <p id="allowlist-hint" class="form-hint" aria-live="polite">
+                  Non-allowlisted bots stay hidden from glasses and return HTTP 403.
+                </p>
+                <ul id="allowlist-rows" class="allowlist-table"></ul>
+                <div class="panel-actions">
+                  <span id="mode-note" class="empty-note"></span>
+                  <button id="btn-demo-reset" class="key key--compact" type="button" hidden>Reset demo</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="panel-audit" role="tabpanel" aria-labelledby="tab-audit" hidden="until-found">
+              <div class="panel-body">
+                <table class="audit-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Action</th>
+                      <th scope="col">Outcome</th>
+                    </tr>
+                  </thead>
+                  <tbody id="audit-rows"></tbody>
+                </table>
+                <p id="audit-empty" class="empty-note">No button presses recorded yet.</p>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </main>
+
+      <footer class="foot">
+        <p>
+          Unofficial Telegram API client running against your own self-hosted gateway. Sessions stay on your machine. No chat lists, no message bodies, no free-text sending, and no AI training on Telegram data.
+        </p>
+      </footer>
+
+      <span id="sr-announce" class="sr-only" aria-live="assertive"></span>
+    </div>
+
+    <dialog id="gateway-dialog" class="gateway-dialog" closedby="any" aria-labelledby="gateway-dialog-title">
+      <div class="dialog-head">
+        <div class="dialog-head-group">
+          <h2 id="gateway-dialog-title" class="dialog-title">Self-hosted gateway</h2>
+          <span id="dialog-spec" class="dialog-spec">MTProto Layer 234 local session</span>
+        </div>
+        <button id="btn-close-gateway" class="key key--quiet" type="button" aria-label="Close gateway settings">
+          Close
+        </button>
+      </div>
+      <div class="dialog-body">
+        <form id="form-gateway" class="dialog-section">
+          <div class="field-group">
+            <label class="dialog-label" for="input-url">Gateway endpoint</label>
+            <input id="input-url" class="field" type="url" placeholder="http://127.0.0.1:8788" autofocus />
+          </div>
+          <div class="field-group">
+            <label class="dialog-label" for="input-token">Bearer token (optional)</label>
+            <input id="input-token" class="field" type="password" placeholder="Leave blank on localhost" />
+          </div>
+          <div class="dialog-row">
+            <button class="key key--primary" type="submit">Save connection</button>
+            <button id="btn-test-gateway" class="key key--quiet" type="button">Test connection</button>
+            <output id="gateway-ping" class="dialog-ping"></output>
+          </div>
+        </form>
+
+        <div class="dialog-section">
+          <span class="dialog-label">Account pairing</span>
+          <p id="pairing-status-text" class="form-hint">Checking gateway mode…</p>
+          <div id="pairing-controls" class="dialog-section"></div>
+          <p id="pairing-feedback" class="form-hint" aria-live="polite"></p>
+          <details id="demo-env-details" class="dialog-details" hidden>
+            <summary>Switch to live MTProto pairing</summary>
+            <p>
+              Provide TG_API_ID and TG_API_HASH in .env and start the gateway without --demo to pair your own account via QR or phone code.
+            </p>
+          </details>
+        </div>
+      </div>
+    </dialog>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

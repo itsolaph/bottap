@@ -1,0 +1,94 @@
+/* Hallmark · Cobalt tokens (dealt 1/3, seed bottap-on-duty-bot-button-c552·c6d5fa64·2026-11-23·r0) */
+:root {
+  --color-paper: oklch(98.6% 0.005 250);
+  --color-paper-2: oklch(96.2% 0.008 252);
+  --color-paper-3: oklch(93% 0.011 252);
+  --color-ink: oklch(21% 0.028 262);
+  --color-ink-2: oklch(36% 0.022 260);
+  --color-muted: oklch(48% 0.018 258);
+  --color-rule: oklch(90% 0.009 252);
+  --color-rule-2: oklch(81% 0.014 254);
+
+  --color-graphite: oklch(19% 0.022 262);
+  --color-graphite-2: oklch(25% 0.024 262);
+  --color-graphite-rule: oklch(31% 0.022 262);
+  --color-graphite-ink: oklch(93% 0.010 250);
+  --color-graphite-muted: oklch(72% 0.018 256);
+
+  /* Authentic Even G2 4-bit monochrome green waveguide phosphor (strictly inside lens screen) */
+  --color-lens-ground: oklch(13% 0.016 156);
+  --color-lens-phosphor: oklch(85% 0.145 152);
+  --color-lens-dim: oklch(68% 0.10 152);
+  --color-lens-rule: oklch(26% 0.04 154);
+
+  /* Electric cobalt primary accent */
+  --color-accent: oklch(50% 0.19 258);
+  --color-accent-deep: oklch(43% 0.20 262);
+  --color-accent-edge: oklch(37% 0.16 260);
+  --color-accent-wash: oklch(95% 0.028 256);
+  --color-accent-ink: oklch(98.6% 0.005 250);
+  --color-focus: oklch(48% 0.20 258);
+
+  /* Semantic protocol states (danger bg_danger & 2FA refusal, high contrast on light paper) */
+  --color-signal-ok: oklch(42% 0.13 154);
+  --color-signal-ok-wash: oklch(95% 0.03 154);
+  --color-signal-warn: oklch(48% 0.15 58);
+  --color-signal-warn-deep: oklch(40% 0.14 54);
+  --color-signal-warn-edge: oklch(33% 0.12 52);
+  --color-signal-warn-wash: oklch(95.5% 0.038 78);
+  --color-signal-danger: oklch(47% 0.18 26);
+  --color-signal-danger-wash: oklch(95% 0.03 26);
+
+  /* Optical waveguide texture tints (strictly inside 576x288 G2 framebuffer) */
+  --color-lens-scanline: oklch(6% 0.01 156 / 0.34);
+  --color-lens-vignette: oklch(4% 0.01 156 / 0.48);
+  --color-lens-sheen: oklch(96% 0.01 152 / 0.05);
+  --color-lens-glow: oklch(85% 0.145 152 / 0.32);
+
+  /* Keycap physical surfaces */
+  --color-key-face: oklch(99.2% 0.004 250);
+  --color-key-edge: oklch(78% 0.016 254);
+  --color-backdrop: oklch(19% 0.022 262 / 0.52);
+
+  /* Typography */
+  --font-display: "Familjen Grotesk", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --tracking-display: -0.028em;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-md: 0.9375rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.75rem;
+  --text-hero: clamp(2rem, 3.2vw, 2.75rem);
+
+  /* Spacing scale */
+  --space-2xs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+
+  /* Geometry & shadows */
+  --rule-hair: 1px;
+  --radius-sm: 4px;
+  --radius-input: 6px;
+  --radius-card: 8px;
+  --cut: 8px;
+  --cut-l: 14px;
+  --shadow-card: 0 1px 2px oklch(21% 0.028 262 / 0.06);
+  --shadow-dialog: 0 10px 18px -6px oklch(21% 0.028 262 / 0.24);
+  --shadow-key: 0 3px 0 0 var(--color-key-edge), 0 6px 8px -4px oklch(21% 0.028 262 / 0.22), inset 0 1px 0 oklch(99.5% 0.002 250 / 0.9);
+  --shadow-key-accent: 0 3px 0 0 var(--color-accent-edge), 0 6px 10px -4px oklch(30% 0.14 260 / 0.42), inset 0 1px 0 oklch(99.5% 0.002 250 / 0.22);
+  --shadow-key-warn: 0 3px 0 0 var(--color-signal-warn-edge), 0 6px 10px -4px oklch(35% 0.14 54 / 0.45), inset 0 1px 0 oklch(99.5% 0.002 70 / 0.22);
+  --shadow-key-press: inset 0 1px 2px oklch(21% 0.028 262 / 0.16);
+
+  /* Motion */
+  --dur-micro: 120ms;
+  --dur-fast: 180ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}

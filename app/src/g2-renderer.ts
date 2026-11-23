@@ -123,7 +123,7 @@ export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
       const btn = item.buttons[state.buttonIndex]!
       return {
         body: [
-          '!! DANGER BUTTON (bg_danger) !!',
+          'DESTRUCTIVE ACTION ARMED',
           fitLine(`@${item.bot}`),
           fitLine(item.line),
           '',

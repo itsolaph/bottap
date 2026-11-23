@@ -131,6 +131,7 @@ Pre-existing open-source libraries, templates, and APIs used:
 | [`@evenrealities/evenhub-cli`](https://www.npmjs.com/package/@evenrealities/evenhub-cli) & [`evenhub-simulator`](https://www.npmjs.com/package/@evenrealities/evenhub-simulator) | `.ehpk` packaging & desktop G2 simulator | MIT |
 | [`even-realities/evenhub-templates`](https://github.com/even-realities/evenhub-templates) | Official protobuf `eventTypeOf` & companion WebView conventions | MIT |
 | [`teleproto`](https://www.npmjs.com/package/teleproto) | Telegram MTProto Layer 234 client (`KeyboardButtonStyle.bgDanger`, `GetBotCallbackAnswer`) | Apache-2.0 |
+| [`@fontsource/familjen-grotesk`](https://fontsource.org/fonts/familjen-grotesk), [`ibm-plex-sans`](https://fontsource.org/fonts/ibm-plex-sans), [`jetbrains-mono`](https://fontsource.org/fonts/jetbrains-mono) | Self-hosted offline typography bundled into `.ehpk` | OFL-1.1 |
 | [`vite`](https://vite.dev/) & [`typescript`](https://www.typescriptlang.org/) | Build and type-checking toolchain | MIT / Apache-2.0 |
 
 ---

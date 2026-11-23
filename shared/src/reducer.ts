@@ -20,6 +20,7 @@ export type G2Action =
   | { readonly type: 'SYNC_ERROR'; readonly message: string }
   | { readonly type: 'SCROLL_UP' }
   | { readonly type: 'SCROLL_DOWN' }
+  | { readonly type: 'FOCUS_ITEM'; readonly index: number; readonly openButtons?: boolean }
   | { readonly type: 'TAP'; readonly now: number }
   | { readonly type: 'DOUBLE_TAP' }
   | { readonly type: 'PRESS_DONE'; readonly outcome: PressOutcome; readonly now: number }
@@ -84,13 +85,17 @@ export function reduceG2State(
       if (!action.paired) {
         return { state: { screen: 'unpaired', mode: action.mode } }
       }
-      // Keep active press/result/refusal/danger screens stable until user dismisses or timer expires
-      if (
-        state.screen === 'pressing' ||
-        state.screen === 'result' ||
-        state.screen === 'refusal' ||
-        state.screen === 'danger_confirm'
-      ) {
+      // Keep active press/result/refusal/danger screens stable, while keeping items fresh
+      if (state.screen === 'pressing' || state.screen === 'result' || state.screen === 'refusal') {
+        return {
+          state: {
+            ...state,
+            items: action.items,
+            itemIndex: clamp(state.itemIndex, action.items.length),
+          },
+        }
+      }
+      if (state.screen === 'danger_confirm') {
         return { state }
       }
       if (action.items.length === 0) {
@@ -190,6 +195,36 @@ export function reduceG2State(
         }
       }
       return { state }
+    }
+
+    case 'FOCUS_ITEM': {
+      const items =
+        state.screen === 'queue' ||
+        state.screen === 'buttons' ||
+        state.screen === 'danger_confirm' ||
+        state.screen === 'result' ||
+        state.screen === 'refusal'
+          ? state.items
+          : null
+      if (!items || items.length === 0) return { state }
+      const idx = clamp(action.index, items.length)
+      if (action.openButtons) {
+        return {
+          state: {
+            screen: 'buttons',
+            items,
+            itemIndex: idx,
+            buttonIndex: 0,
+          },
+        }
+      }
+      return {
+        state: {
+          screen: 'queue',
+          items,
+          cursor: idx,
+        },
+      }
     }
 
     case 'DOUBLE_TAP': {
