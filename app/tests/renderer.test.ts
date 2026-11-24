@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { renderG2Frame } from '../src/g2-renderer.js'
+import { buildQrSvgModel } from '../src/qr-svg.js'
 import type { G2ViewState, QueueItem } from '@bottap/shared'
 
 const sampleItem: QueueItem = {
@@ -98,4 +99,11 @@ test('danger_confirm shows PRESS AGAIN and refusal shows 2FA message', () => {
     shownAt: 5000,
   })
   assert.match(refusalFrame.body, /2FA button - open Telegram/)
+})
+
+test('buildQrSvgModel encodes Telegram QR login URIs with a 4-module quiet zone', () => {
+  const model = buildQrSvgModel('tg://login?token=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA')
+  assert.ok(model.size >= 37, `expected QR matrix with quiet zone >= 37, got ${model.size}`)
+  assert.ok(model.moduleCount > 100, 'expected non-trivial dark modules')
+  assert.match(model.pathData, /^M4 4h7v1h-7z/, 'top-left finder pattern must start at quiet-zone offset (4,4)')
 })

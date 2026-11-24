@@ -27,6 +27,7 @@ import {
 } from '@bottap/shared'
 import { GatewayClient } from './client'
 import { renderG2Frame, type G2Frame } from './g2-renderer'
+import { createQrSvgElement } from './qr-svg'
 
 const STORAGE_URL_KEY = 'bottap.gatewayUrl'
 const STORAGE_TOKEN_KEY = 'bottap.gatewayToken'
@@ -58,9 +59,17 @@ let lastRenderedLensKey = ''
 let lastQueueKey = ''
 let lastAllowlistKey = ''
 let lastAuditKey = ''
+let lastPairingKey = ''
 let lastAnnounced = ''
 let bridgeWriteQueue: Promise<unknown> = Promise.resolve()
 let qrPollTimer: number | null = null
+
+function stopQrPoll(): void {
+  if (qrPollTimer !== null) {
+    window.clearInterval(qrPollTimer)
+    qrPollTimer = null
+  }
+}
 
 // Official Even Hub protobuf envelope helper:
 // CLICK_EVENT is 0, omitted on the wire; default MUST resolve inside the envelope check.
@@ -410,17 +419,29 @@ function renderPairingModalState(): void {
   if (!statusText || !controls) return
 
   const pairing = lastStatus?.pairing
+  const pairingKey = pairing
+    ? `${pairing.mode}|${pairing.status}|${pairing.hasApiCreds}|${pairing.accountLabel ?? ''}|${pairing.phoneMask ?? ''}|${pairing.qrUrl ?? ''}`
+    : 'offline'
+
   if (!pairing) {
     statusText.textContent = 'Gateway unreachable. Test or update the endpoint URL above.'
     if (demoDetails) demoDetails.hidden = true
-    controls.replaceChildren()
+    if (pairingKey !== lastPairingKey) {
+      lastPairingKey = pairingKey
+      stopQrPoll()
+      controls.replaceChildren()
+    }
     return
   }
 
   if (pairing.mode === 'demo') {
     statusText.textContent = 'Connected to offline Demo Sandbox fixtures.'
     if (demoDetails) demoDetails.hidden = false
-    controls.replaceChildren()
+    if (pairingKey !== lastPairingKey) {
+      lastPairingKey = pairingKey
+      stopQrPoll()
+      controls.replaceChildren()
+    }
     return
   }
 
@@ -430,9 +451,17 @@ function renderPairingModalState(): void {
       ? `Paired as ${pairing.accountLabel || 'authorized account'}. Session stays on your gateway.`
       : `Live MTProto gateway (${pairing.status}). Session stays local to your gateway.`
 
+  if (pairing.status === 'paired' || pairing.status === 'awaiting_2fa') {
+    stopQrPoll()
+  }
+
+  if (pairingKey === lastPairingKey) {
+    return
+  }
   if (controls.contains(document.activeElement) && document.activeElement?.tagName === 'INPUT') {
     return
   }
+  lastPairingKey = pairingKey
 
   const nodes: HTMLElement[] = []
 
@@ -441,23 +470,33 @@ function renderPairingModalState(): void {
 
   const qrBtn = document.createElement('button')
   qrBtn.type = 'button'
-  qrBtn.className = 'key key--primary'
-  qrBtn.textContent = 'Start QR pairing'
+  qrBtn.className = pairing.status === 'unpaired' ? 'key key--primary' : 'key'
+  qrBtn.textContent = pairing.status === 'qr_pending' ? 'Refresh QR' : 'Start QR pairing'
   qrBtn.addEventListener('click', async () => {
     try {
       const res = await client.startQrPairing()
-      if (feedback) feedback.textContent = res.pairing.error || 'Waiting for Telegram QR scan…'
+      if (feedback) {
+        feedback.textContent = res.pairing.error || 'Scan QR in Telegram: Settings -> Devices -> Link Desktop Device.'
+      }
       await refreshFromGateway()
-      if (qrPollTimer) window.clearInterval(qrPollTimer)
-      qrPollTimer = window.setInterval(async () => {
-        const polled = await client.pollQrPairing()
-        if (polled.pairing.status === 'paired' && qrPollTimer) {
-          window.clearInterval(qrPollTimer)
-          qrPollTimer = null
-          if (feedback) feedback.textContent = 'Paired.'
-        }
-        await refreshFromGateway()
-      }, 3000)
+      stopQrPoll()
+      if (res.pairing.status === 'qr_pending') {
+        qrPollTimer = window.setInterval(async () => {
+          try {
+            const polled = await client.pollQrPairing()
+            if (polled.pairing.status === 'paired') {
+              stopQrPoll()
+              if (feedback) feedback.textContent = 'Paired.'
+            } else if (polled.pairing.status === 'awaiting_2fa') {
+              stopQrPoll()
+              if (feedback) feedback.textContent = 'Enter your Telegram 2FA cloud password below.'
+            }
+            await refreshFromGateway()
+          } catch {
+            stopQrPoll()
+          }
+        }, 3000)
+      }
     } catch (err) {
       if (feedback) feedback.textContent = err instanceof Error ? err.message : 'QR pairing failed'
     }
@@ -470,6 +509,7 @@ function renderPairingModalState(): void {
     signOut.className = 'key'
     signOut.textContent = 'Sign out'
     signOut.addEventListener('click', async () => {
+      stopQrPoll()
       await client.disconnect()
       if (feedback) feedback.textContent = 'Session cleared on gateway.'
       await refreshFromGateway()
@@ -479,10 +519,43 @@ function renderPairingModalState(): void {
   nodes.push(row)
 
   if (pairing.qrUrl) {
+    const qrPlate = document.createElement('div')
+    qrPlate.className = 'qr-plate'
+
+    const qrFrame = document.createElement('div')
+    qrFrame.className = 'qr-frame'
+    qrFrame.append(createQrSvgElement(pairing.qrUrl, 'Telegram QR login code'))
+
+    const qrMeta = document.createElement('div')
+    qrMeta.className = 'qr-meta'
+
+    const steps = document.createElement('p')
+    steps.className = 'qr-steps'
+    steps.textContent = 'Open Telegram on your phone: Settings -> Devices -> Link Desktop Device.'
+
+    const copyBtn = document.createElement('button')
+    copyBtn.type = 'button'
+    copyBtn.className = 'key key--quiet'
+    copyBtn.textContent = 'Copy tg:// link'
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(pairing.qrUrl!)
+        copyBtn.textContent = 'Copied'
+        window.setTimeout(() => {
+          copyBtn.textContent = 'Copy tg:// link'
+        }, 1500)
+      } catch {
+        if (feedback) feedback.textContent = 'Copy failed; select the URI below.'
+      }
+    })
+
     const qrBox = document.createElement('div')
     qrBox.className = 'qr-readout'
     qrBox.textContent = pairing.qrUrl
-    nodes.push(qrBox)
+
+    qrMeta.append(steps, copyBtn, qrBox)
+    qrPlate.append(qrFrame, qrMeta)
+    nodes.push(qrPlate)
   }
 
   if (pairing.status === 'unpaired') {
@@ -726,6 +799,7 @@ function setupGatewayDialog(): void {
 
   dialog.addEventListener('close', () => {
     dialog.returnValue = ''
+    stopQrPoll()
   })
 
   testBtn?.addEventListener('click', async () => {
@@ -855,7 +929,7 @@ async function initEvenBridge(): Promise<void> {
       xPosition: 0,
       yPosition: 0,
       width: 576,
-      height: 244,
+      height: 240,
       borderWidth: 0,
       borderColor: 5,
       paddingLength: 6,
@@ -867,12 +941,12 @@ async function initEvenBridge(): Promise<void> {
 
     const footerContainer = new TextContainerProperty({
       xPosition: 0,
-      yPosition: 250,
+      yPosition: 244,
       width: 576,
-      height: 34,
+      height: 44,
       borderWidth: 0,
       borderColor: 5,
-      paddingLength: 4,
+      paddingLength: 2,
       containerID: 2,
       containerName: 'footer',
       content: initialFrame.footer,

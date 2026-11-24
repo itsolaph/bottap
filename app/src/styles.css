@@ -531,12 +531,18 @@ textarea {
 
 .queue-row[data-focused="true"] .queue-row-btn {
   background-color: var(--color-accent-wash);
-  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+.queue-row[data-focused="true"] .queue-bot {
+  color: var(--color-accent-deep);
 }
 
 .queue-row[data-armed="true"] .queue-row-btn {
   background-color: var(--color-signal-warn-wash);
-  box-shadow: inset 3px 0 0 var(--color-signal-warn);
+}
+
+.queue-row[data-armed="true"] .queue-bot {
+  color: var(--color-signal-warn);
 }
 
 .queue-row-head {
@@ -912,11 +918,60 @@ dialog.gateway-dialog::backdrop {
   max-width: 52ch;
 }
 
-.qr-readout {
+.qr-plate {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-md);
+  align-items: start;
   padding: var(--space-sm);
-  background-color: var(--color-graphite);
-  color: var(--color-lens-phosphor);
+  background-color: var(--color-paper-2);
+  border: var(--rule-hair) solid var(--color-rule-2);
   border-radius: var(--radius-input);
+}
+
+.qr-frame {
+  width: 176px;
+  height: 176px;
+  background-color: var(--color-qr-light);
+  border: var(--rule-hair) solid var(--color-rule-2);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.qr-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.qr-svg-bg {
+  fill: var(--color-qr-light);
+}
+
+.qr-svg-fg {
+  fill: var(--color-qr-dark);
+}
+
+.qr-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  min-width: 0;
+}
+
+.qr-steps {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-ink-2);
+}
+
+.qr-readout {
+  padding: var(--space-xs);
+  background-color: var(--color-paper);
+  color: var(--color-ink-2);
+  border: var(--rule-hair) solid var(--color-rule);
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   word-break: break-all;
@@ -958,6 +1013,11 @@ dialog.gateway-dialog::backdrop {
 
   .policy-strip {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .qr-plate {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
   }
 }
 

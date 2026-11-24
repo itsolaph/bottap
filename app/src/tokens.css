@@ -49,6 +49,8 @@
   --color-key-face: oklch(99.2% 0.004 250);
   --color-key-edge: oklch(78% 0.016 254);
   --color-backdrop: oklch(19% 0.022 262 / 0.52);
+  --color-qr-light: oklch(99.2% 0.005 250);
+  --color-qr-dark: oklch(14% 0.02 262);
 
   /* Typography */
   --font-display: "Familjen Grotesk", system-ui, sans-serif;

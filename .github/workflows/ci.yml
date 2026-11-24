@@ -1,0 +1,41 @@
+name: BotTap CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: npm run pack:g2
+      - name: Verify packaged .ehpk artifact
+        run: test -s app/dist/bottap.ehpk
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build gateway Docker image
+        run: docker build -f gateway/Dockerfile -t bottap-gateway:ci .
+      - name: Smoke-test container health and filtered queue
+        run: |
+          docker run -d --name bottap-ci -p 18788:8788 -e BOTTAP_MODE=demo bottap-gateway:ci
+          trap 'docker rm -f bottap-ci' EXIT
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:18788/health; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18788/health | grep -q '"ok":true'
+          curl -fsS http://127.0.0.1:18788/pending | grep -q '"uptime_ops_bot"'
+          ! curl -fsS http://127.0.0.1:18788/pending | grep -q '"random_promo_bot"'

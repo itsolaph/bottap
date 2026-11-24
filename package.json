@@ -8,15 +8,17 @@
   "workspaces": [
     "shared",
     "gateway",
-    "app"
+    "app",
+    "demo-bots"
   ],
   "scripts": {
     "dev:gateway": "npm --workspace=gateway run dev",
     "dev:gateway:demo": "npm --workspace=gateway run dev:demo",
     "dev:app": "npm --workspace=app run dev",
-    "build": "npm --workspace=shared run build && npm --workspace=gateway run build && npm --workspace=app run build",
-    "typecheck": "npm --workspace=shared run typecheck && npm --workspace=gateway run typecheck && npm --workspace=app run typecheck",
-    "test": "npm --workspace=shared run test && npm --workspace=gateway run test && npm --workspace=app run test",
+    "demo:bot": "npm --workspace=demo-bots run start",
+    "build": "npm --workspace=shared run build && npm --workspace=gateway run build && npm --workspace=app run build && npm --workspace=demo-bots run build",
+    "typecheck": "npm --workspace=shared run build && npm --workspace=shared run typecheck && npm --workspace=gateway run typecheck && npm --workspace=app run typecheck && npm --workspace=demo-bots run typecheck",
+    "test": "npm --workspace=shared run test && npm --workspace=gateway run test && npm --workspace=app run test && npm --workspace=demo-bots run test",
     "pack:g2": "npm --workspace=app run pack",
     "simulate": "npm --workspace=app run simulate"
   }

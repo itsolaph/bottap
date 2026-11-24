@@ -5,6 +5,7 @@ COPY package.json package-lock.json* ./
 COPY shared/package.json shared/package.json
 COPY gateway/package.json gateway/package.json
 COPY app/package.json app/package.json
+COPY demo-bots/package.json demo-bots/package.json
 
 RUN npm ci --workspaces --include-workspace-root
 
@@ -12,7 +13,7 @@ COPY shared shared
 COPY gateway gateway
 COPY app app
 
-RUN npm run build
+RUN npm --workspace=shared run build && npm --workspace=gateway run build && npm --workspace=app run build
 
 FROM node:24-slim AS runtime
 WORKDIR /app
@@ -25,6 +26,8 @@ ENV BOTTAP_STATIC_DIR=/app/app/dist
 COPY package.json package-lock.json* ./
 COPY shared/package.json shared/package.json
 COPY gateway/package.json gateway/package.json
+COPY app/package.json app/package.json
+COPY demo-bots/package.json demo-bots/package.json
 COPY --from=build /app/shared/dist shared/dist
 COPY --from=build /app/gateway/dist gateway/dist
 COPY --from=build /app/app/dist app/dist

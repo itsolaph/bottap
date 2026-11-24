@@ -42,7 +42,8 @@ Allowlisted Telegram Bots (messages.getBotCallbackAnswer)
 
 - `shared/` — Zero-dependency pure functional core: strict inline-button classifier, 40-char single-line alert sanitizer, allowlist normalizer, and deterministic G2 lens state machine (`reduceG2State`).
 - `gateway/` — Self-hosted Node 24 HTTP server + `teleproto` Layer 234 MTProto transport + atomic `0600` session/audit store + one-command Docker container. Includes an explicitly labelled `--demo` offline sandbox transport for testing without Telegram credentials.
-- `app/` — Vite + TypeScript Even Hub app (`@evenrealities/even_hub_sdk`), 576x288 monochrome renderer, R1 ring event router, and companion WebView for QR / phone+code pairing, allowlist management, and audit logs.
+- `app/` — Vite + TypeScript Even Hub app (`@evenrealities/even_hub_sdk`), 576x288 monochrome renderer, R1 ring event router, and companion WebView with scannable SVG QR pairing, phone+code/2FA pairing, allowlist management, and audit logs.
+- `demo-bots/` — Zero-dependency Telegram Bot API long-polling runner that sends real inline-keyboard alerts (`/uptime`, `/deploy` with `style: "danger"`, `/slow` timeout test, `/all`) against your own `@BotFather` bot for end-to-end testing with live Telegram accounts.
 
 ---
 
@@ -86,7 +87,21 @@ docker compose up -d --build
 
 3. Open `http://<your-host>:8788` in your phone or desktop browser, pair via **QR** or **phone + code** (your MTProto session file stays inside the Docker volume `/data/session.txt` with `0600` permissions), and point the Even Hub app at your gateway URL.
 
-### 3. Pack `.ehpk` for Even Hub
+### 3. Live Telegram Demo Bot (Real Account Testing)
+
+To test the full MTProto loop against a real Telegram bot without mocks:
+
+1. Create a test bot with `@BotFather` and export its token as `DEMO_BOT_TOKEN`.
+2. Add the bot's username to `BOTTAP_ALLOWLIST` in the companion app or `.env`.
+3. Run the zero-dependency Bot API runner:
+
+```bash
+DEMO_BOT_TOKEN=123456:your-bot-token npm run demo:bot
+```
+
+4. Message your bot `/all` (or `/uptime`, `/deploy`, `/slow`) in Telegram. It sends real inline callback alerts including a `style: "danger"` deploy gate (triggering G2's double-press safety gate), real URL buttons (stripped at the gateway), and an unanswered callback to verify `BOT_RESPONSE_TIMEOUT` logging.
+
+### 4. Pack `.ehpk` for Even Hub
 
 ```bash
 npm run pack:g2
@@ -113,12 +128,14 @@ There are intentionally **no** `/chats`, `/messages`, `/dialogs`, or `/send` rou
 
 ## What Existed Before Nov 23
 
-All BotTap source code (`shared/`, `gateway/`, `app/`, tests, Dockerfile, and documentation) was written from scratch after the Heads Up hackathon kickoff on **November 23, 2026**.
+All BotTap source code (`shared/`, `gateway/`, `app/`, `demo-bots/`, tests, CI workflow, Dockerfile, and documentation) was written from scratch after the Heads Up hackathon kickoff on **November 23, 2026**.
 
 Pre-existing open-source libraries, templates, and APIs used:
 - Even Hub starter patterns from `even-realities/evenhub-templates` (`minimal` & `text-heavy`)
 - Official Even Realities packages (`@evenrealities/even_hub_sdk`, `@evenrealities/evenhub-cli`, `@evenrealities/evenhub-simulator`)
 - `teleproto` MTProto client library for Telegram Layer 234
+- `uqr` zero-dependency QR encoder for scannable SVG pairing
+- Self-hosted Fontsource fonts (`Familjen Grotesk`, `IBM Plex Sans`, `JetBrains Mono`)
 - Vite and TypeScript toolchains
 
 ---
@@ -131,6 +148,7 @@ Pre-existing open-source libraries, templates, and APIs used:
 | [`@evenrealities/evenhub-cli`](https://www.npmjs.com/package/@evenrealities/evenhub-cli) & [`evenhub-simulator`](https://www.npmjs.com/package/@evenrealities/evenhub-simulator) | `.ehpk` packaging & desktop G2 simulator | MIT |
 | [`even-realities/evenhub-templates`](https://github.com/even-realities/evenhub-templates) | Official protobuf `eventTypeOf` & companion WebView conventions | MIT |
 | [`teleproto`](https://www.npmjs.com/package/teleproto) | Telegram MTProto Layer 234 client (`KeyboardButtonStyle.bgDanger`, `GetBotCallbackAnswer`) | Apache-2.0 |
+| [`uqr`](https://www.npmjs.com/package/uqr) | Zero-dependency QR encoder for scannable SVG Telegram login pairing | MIT |
 | [`@fontsource/familjen-grotesk`](https://fontsource.org/fonts/familjen-grotesk), [`ibm-plex-sans`](https://fontsource.org/fonts/ibm-plex-sans), [`jetbrains-mono`](https://fontsource.org/fonts/jetbrains-mono) | Self-hosted offline typography bundled into `.ehpk` | OFL-1.1 |
 | [`vite`](https://vite.dev/) & [`typescript`](https://www.typescriptlang.org/) | Build and type-checking toolchain | MIT / Apache-2.0 |
 
