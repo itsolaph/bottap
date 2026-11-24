@@ -84,7 +84,10 @@ export class TelegramBotApiClient {
     } catch (err) {
       const status = (err as Partial<TelegramApiError>).status
       const desc = (err as Partial<TelegramApiError>).description ?? ''
-      if (status === 400 && /style|keyboard|bad request/i.test(desc)) {
+      if (status === 400 && /unknown.*style|style.*invalid|button.*style/i.test(desc)) {
+        console.warn(
+          `[bottap-demo-bot] Telegram rejected button style (${desc}); retrying unstyled (BotTap lexical danger policy still guards destructive actions)`,
+        )
         return this.call<TelegramMessage>('sendMessage', {
           chat_id: chatId,
           text: spec.text,

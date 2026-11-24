@@ -4,7 +4,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { AddressInfo } from 'node:net'
+import { Api } from 'teleproto'
+import { buildQueueItem } from '@bottap/shared'
 import { DemoBotTransport } from '../src/demo-transport.js'
+import { extractInlineButtons } from '../src/mtproto-transport.js'
 import { createGatewayServer } from '../src/server.js'
 import { GatewayStore } from '../src/store.js'
 
@@ -26,15 +29,83 @@ async function withServer(
   }
 }
 
+test('Real teleproto Layer 234 ReplyInlineMarkup parses KeyboardInlineButton, bgDanger, 2FA, and strips URL buttons', () => {
+  const markup = new Api.ReplyInlineMarkup({
+    rows: [
+      new Api.KeyboardInlineButtonRow({
+        buttons: [
+          new Api.KeyboardInlineButton({
+            text: 'Approve Prod',
+            style: new Api.KeyboardButtonStyle({ bgDanger: true }),
+            type: new Api.InlineButtonTypeCallback({
+              data: Buffer.from('deploy:approve:8209'),
+              requiresPassword: false,
+            }),
+          }),
+          new Api.KeyboardInlineButton({
+            text: 'Rotate Key',
+            style: new Api.KeyboardButtonStyle({ bgDanger: true }),
+            type: new Api.InlineButtonTypeCallback({
+              data: Buffer.from('vault:rotate:9055'),
+              requiresPassword: true,
+            }),
+          }),
+          new Api.KeyboardInlineButton({
+            text: 'Open Diff',
+            type: new Api.InlineButtonTypeUrl({ url: 'https://ci.internal/diff/8209' }),
+          }),
+        ],
+      }),
+    ],
+  })
+
+  const rawButtons = extractInlineButtons(markup)
+  assert.equal(rawButtons.length, 3)
+  assert.equal(rawButtons[0]!.typeName, 'InlineButtonTypeCallback')
+  assert.equal(rawButtons[0]!.style?.bgDanger, true)
+  assert.equal(rawButtons[1]!.requiresPassword, true)
+  assert.equal(rawButtons[2]!.typeName, 'InlineButtonTypeUrl')
+
+  const item = buildQueueItem(
+    {
+      botHandle: 'deploy_gate_bot',
+      botTitle: 'Deploy Gate',
+      chatPeer: '-1001999888777',
+      chatTitle: '#ops-alerts',
+      msgId: 8209,
+      rawText: '🚨 Release v2.14.0 ready for prod-eu-1\nDiff details in Telegram',
+      sentAt: 1_763_900_000_000,
+      buttons: rawButtons,
+    },
+    ['deploy_gate_bot'],
+  )
+
+  assert.ok(item)
+  assert.equal(item.id, '-1001999888777:8209')
+  assert.equal(item.line, 'Release v2.14.0 ready for prod-eu-1')
+  assert.equal(item.hiddenNonCallbackCount, 1)
+  assert.equal(item.buttons.length, 2)
+  assert.equal(item.buttons[0]!.danger, true)
+  assert.equal(item.buttons[0]!.dangerSource, 'protocol')
+  assert.equal(item.buttons[1]!.requiresPassword, true)
+})
+
 test('GET /pending returns allowlisted callback buttons only and hides non-allowlisted bots + url/webview buttons', async () => {
   await withServer(async (baseUrl) => {
     const res = await fetch(`${baseUrl}/pending`)
     assert.equal(res.status, 200)
     const data = (await res.json()) as {
-      items: Array<{ bot: string; buttons: Array<{ label: string; danger: boolean; requiresPassword: boolean }>; hiddenNonCallbackCount: number }>
+      items: Array<{
+        bot: string
+        chatPeer: string
+        buttons: Array<{ label: string; danger: boolean; requiresPassword: boolean }>
+        hiddenNonCallbackCount: number
+      }>
+      scanDiagnostics: unknown[]
     }
 
     assert.equal(data.items.length, 3)
+    assert.deepEqual(data.scanDiagnostics, [])
     assert.equal(
       data.items.some((i) => i.bot === 'random_promo_bot'),
       false,
@@ -51,7 +122,7 @@ test('GET /pending returns allowlisted callback buttons only and hides non-allow
   })
 })
 
-test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allowlist 403 block', async () => {
+test('POST /press enforces bg_danger 409 double-press, non-consumption on mismatch, 2FA 403, allowlist 403, and tombstones', async () => {
   await withServer(async (baseUrl) => {
     // 1. Non-allowlisted bot refused with 403
     const blockedBot = await fetch(`${baseUrl}/press`, {
@@ -97,7 +168,19 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
       'DANGER_CONFIRMATION_REQUIRED',
     )
 
-    // 4. Two-step server-issued armToken + confirmedDanger=true succeeds and consumes token
+    // 4. Arming a non-danger button is rejected with 400
+    const armSafe = await fetch(`${baseUrl}/arm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bot: 'deploy_gate_bot',
+        msgId: 8209,
+        dataB64: Buffer.from('deploy:hold:8209').toString('base64'),
+      }),
+    })
+    assert.equal(armSafe.status, 400)
+
+    // 5. Issue real armToken, verify wrong token returns 409 without burning real token, then confirm succeeds
     const armRes = await fetch(`${baseUrl}/arm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -110,6 +193,19 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
     assert.equal(armRes.status, 200)
     const { armToken } = (await armRes.json()) as { ok: boolean; armToken: string }
     assert.ok(armToken && armToken.length >= 16)
+
+    const badTok = await fetch(`${baseUrl}/press`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bot: 'deploy_gate_bot',
+        msgId: 8209,
+        dataB64: Buffer.from('deploy:approve:8209').toString('base64'),
+        confirmedDanger: true,
+        armToken: 'not-a-valid-token',
+      }),
+    })
+    assert.equal(badTok.status, 409)
 
     const confirmedDanger = await fetch(`${baseUrl}/press`, {
       method: 'POST',
@@ -128,7 +224,16 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
     assert.equal(ok.answer, 'Deploy approved')
     assert.match(ok.editedLine, /promoted/)
 
-    // 5. BOT_RESPONSE_TIMEOUT returns 200 with timedOut=true and logs press
+    // Tombstone suppresses 8209 from /pending
+    const pendingAfter = (await (await fetch(`${baseUrl}/pending`)).json()) as {
+      items: Array<{ bot: string; msgId: number }>
+    }
+    assert.equal(
+      pendingAfter.items.some((i) => i.bot === 'deploy_gate_bot' && i.msgId === 8209),
+      false,
+    )
+
+    // 6. BOT_RESPONSE_TIMEOUT returns 200 with timedOut=true and logs press
     const timeoutRes = await fetch(`${baseUrl}/press`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -143,11 +248,58 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
   })
 })
 
+test('Allowlist and ops groups CRUD write audit entries and /health respects proxy fail-closed boundary', async () => {
+  await withServer(async (baseUrl) => {
+    const health = await fetch(`${baseUrl}/health`)
+    assert.equal(health.status, 200)
+    const hJson = (await health.json()) as { ok: boolean; mode: string; tokenRequired: boolean }
+    assert.deepEqual(hJson, { ok: true, mode: 'demo', tokenRequired: false })
+
+    const proxiedHealth = await fetch(`${baseUrl}/health`, {
+      headers: { 'X-Forwarded-For': '203.0.113.10' },
+    })
+    assert.equal(proxiedHealth.status, 403)
+
+    const addGroup = await fetch(`${baseUrl}/groups`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ group: '-1001999888777' }),
+    })
+    assert.equal(addGroup.status, 200)
+    assert.deepEqual(((await addGroup.json()) as { groups: string[] }).groups, ['-1001999888777'])
+
+    const rmGroup = await fetch(`${baseUrl}/groups/${encodeURIComponent('-1001999888777')}`, {
+      method: 'DELETE',
+    })
+    assert.equal(rmGroup.status, 200)
+    assert.deepEqual(((await rmGroup.json()) as { groups: string[] }).groups, [])
+
+    const addBot = await fetch(`${baseUrl}/allowlist`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bot: '@pager_ops_bot' }),
+    })
+    assert.equal(addBot.status, 200)
+
+    const status = (await (await fetch(`${baseUrl}/status`)).json()) as {
+      recentAudit: Array<{ outcome: string; bot: string }>
+    }
+    assert.ok(
+      status.recentAudit.some((e) => e.outcome === 'allowlist_add' && e.bot === 'pager_ops_bot'),
+      'allowlist mutation must be audited',
+    )
+  })
+})
+
 test('Gateway exposes zero read-chat or send-message endpoints, blocks untrusted origins, and enforces Bearer token', async () => {
   await withServer(async (baseUrl) => {
     const unauth = await fetch(`${baseUrl}/pending`)
     assert.equal(unauth.status, 401)
-    assert.equal(unauth.headers.get('access-control-allow-origin'), null, 'must not emit wildcard CORS by default')
+    assert.equal(
+      unauth.headers.get('access-control-allow-origin'),
+      null,
+      'must not emit wildcard CORS by default',
+    )
 
     const crossOriginPost = await fetch(`${baseUrl}/press`, {
       method: 'POST',
@@ -169,7 +321,7 @@ test('Gateway exposes zero read-chat or send-message endpoints, blocks untrusted
   }, 'secret-test-tok')
 })
 
-test('Tokenless loopback gateway blocks proxy headers and DNS-rebinding Host headers', async () => {
+test('Tokenless loopback gateway blocks proxy headers', async () => {
   await withServer(async (baseUrl) => {
     const proxied = await fetch(`${baseUrl}/pending`, {
       headers: { 'X-Forwarded-For': '203.0.113.10' },

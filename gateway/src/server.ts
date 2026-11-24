@@ -6,7 +6,9 @@ import {
   buildQueueItem,
   decodeBase64ToBytes,
   isAllowlisted,
+  isGroupAllowlisted,
   normalizeBotHandle,
+  normalizeChatPeer,
   sanitizeAlertLine,
   type ArmRequest,
   type ArmResponse,
@@ -16,6 +18,7 @@ import {
   type PressOutcome,
   type PressRequest,
   type QueueItem,
+  type ScanDiagnostic,
 } from '@bottap/shared'
 import type { GatewayStore } from './store.js'
 import type { BotTransport } from './transport.js'
@@ -221,28 +224,43 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
     }
   }
 
-  const issueArmToken = (bot: string, msgId: number, dataB64: string): ArmResponse => {
+  const armKey = (chatPeer: string, bot: string, msgId: number, dataB64: string, line: string) =>
+    `${chatPeer}:${bot}:${msgId}:${dataB64}:${line}`
+
+  const issueArmToken = (
+    chatPeer: string,
+    bot: string,
+    msgId: number,
+    dataB64: string,
+    line: string,
+  ): ArmResponse => {
     const now = Date.now()
     pruneArmed(now)
     const armToken = crypto.randomBytes(16).toString('base64url')
     const expiresAt = now + ARM_TTL_MS
-    armedTokens.set(armToken, { key: `${bot}:${msgId}:${dataB64}`, expiresAt })
+    armedTokens.set(armToken, { key: armKey(chatPeer, bot, msgId, dataB64, line), expiresAt })
     return { ok: true, armToken, expiresAt }
   }
 
   const consumeArmToken = (
     token: string | undefined,
+    chatPeer: string,
     bot: string,
     msgId: number,
     dataB64: string,
+    line: string,
   ): boolean => {
     const now = Date.now()
     pruneArmed(now)
     if (!token) return false
     const rec = armedTokens.get(token)
     if (!rec) return false
+    const expected = armKey(chatPeer, bot, msgId, dataB64, line)
+    if (now >= rec.expiresAt || rec.key !== expected) {
+      return false
+    }
     armedTokens.delete(token)
-    return now < rec.expiresAt && rec.key === `${bot}:${msgId}:${dataB64}`
+    return true
   }
 
   const logAudit = (
@@ -263,15 +281,21 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
     })
   }
 
-  const getFilteredQueue = async (): Promise<QueueItem[]> => {
+  const getFilteredQueue = async (): Promise<{
+    items: QueueItem[]
+    diagnostics: ScanDiagnostic[]
+  }> => {
     const allowlist = store.getAllowlist()
-    const rawItems = await transport.scanPending(allowlist)
+    const groups = store.getGroups()
+    const scan = await transport.scanPending(allowlist, groups)
     const items: QueueItem[] = []
-    for (const raw of rawItems) {
+    for (const raw of scan.items) {
       const built = buildQueueItem(raw, allowlist)
-      if (built) items.push(built)
+      if (!built) continue
+      if (store.isRecentlyPressed(built.chatPeer, built.msgId)) continue
+      items.push(built)
     }
-    return items
+    return { items, diagnostics: scan.diagnostics }
   }
 
   return http.createServer(async (req, res) => {
@@ -298,14 +322,23 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
       }
 
       if (method === 'GET' && pathname === '/health') {
+        const proxyDenied =
+          !options.authToken && (hasProxyHeaders(req) || !isLoopbackHostHeader(req.headers.host))
         sendJson(
           res,
-          200,
-          {
-            ok: true,
-            mode: transport.mode,
-          },
-          cors.headerValue,
+          proxyDenied ? 403 : 200,
+          proxyDenied
+            ? {
+                ok: false,
+                code: 'TOKEN_REQUIRED_FOR_PROXY',
+                message: 'Set BOTTAP_TOKEN before accessing via proxy',
+              }
+            : {
+                ok: true,
+                mode: transport.mode,
+                tokenRequired: Boolean(options.authToken),
+              },
+          proxyDenied ? null : cors.headerValue,
         )
         return
       }
@@ -317,6 +350,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
         !pathname.startsWith('/pending') &&
         !pathname.startsWith('/status') &&
         !pathname.startsWith('/allowlist') &&
+        !pathname.startsWith('/groups') &&
         !pathname.startsWith('/pairing') &&
         !pathname.startsWith('/arm')
       ) {
@@ -374,15 +408,17 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           return
         }
         const rawPairing = transport.getPairingState()
-        // Never expose live login QR token on /status; only /pairing/qr serves qrUrl
         const { qrUrl: _redactedQr, ...safePairing } = rawPairing
-        const items = rawPairing.status === 'paired' ? await getFilteredQueue() : []
+        const queue =
+          rawPairing.status === 'paired' ? await getFilteredQueue() : { items: [], diagnostics: [] }
         const payload: GatewayStatus = {
           ok: true,
           mode: transport.mode,
           pairing: safePairing,
           allowlist: store.getAllowlist(),
-          pendingCount: items.length,
+          groups: store.getGroups(),
+          pendingCount: queue.items.length,
+          scanDiagnostics: queue.diagnostics,
           recentAudit: store.getRecentAudit(),
         }
         sendJson(res, 200, payload, cors.headerValue)
@@ -400,21 +436,24 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           return
         }
         const pairing = transport.getPairingState()
-        const items = pairing.status === 'paired' ? await getFilteredQueue() : []
+        const queue =
+          pairing.status === 'paired' ? await getFilteredQueue() : { items: [], diagnostics: [] }
         const payload: PendingResponse = {
           mode: transport.mode,
           paired: pairing.status === 'paired',
           allowlist: store.getAllowlist(),
-          items,
+          groups: store.getGroups(),
+          items: queue.items,
+          scanDiagnostics: queue.diagnostics,
           fetchedAt: Date.now(),
         }
         sendJson(res, 200, payload, cors.headerValue)
         return
       }
 
-      // Server-issued single-use arm token for bg_danger double-press confirmation
+      // Server-issued single-use arm token bound to exact live (chatPeer, bot, msgId, dataB64, line)
       if (method === 'POST' && pathname === '/arm') {
-        if (!limiter.allow(`press:${ip}`, 40)) {
+        if (!limiter.allow(`arm:${ip}`, 40)) {
           sendJson(
             res,
             429,
@@ -425,10 +464,11 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
         }
         const body = await readJsonBody<Partial<ArmRequest>>(req)
         const bot = normalizeBotHandle(typeof body.bot === 'string' ? body.bot : '')
+        const chatPeer = normalizeChatPeer(typeof body.chatPeer === 'string' ? body.chatPeer : '') ?? bot
         const msgId = typeof body.msgId === 'number' ? body.msgId : -1
         const dataB64 = typeof body.dataB64 === 'string' ? body.dataB64 : ''
         const dataBytes = decodeBase64ToBytes(dataB64)
-        if (!bot || !Number.isInteger(msgId) || msgId <= 0 || !dataBytes) {
+        if (!bot || !chatPeer || !Number.isInteger(msgId) || msgId <= 0 || !dataBytes) {
           sendJson(
             res,
             400,
@@ -446,7 +486,9 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           )
           return
         }
-        if (!isAllowlisted(bot, store.getAllowlist())) {
+        const allowlist = store.getAllowlist()
+        const groups = store.getGroups()
+        if (!isAllowlisted(bot, allowlist) || (chatPeer !== bot && !isGroupAllowlisted(chatPeer, groups))) {
           sendJson(
             res,
             403,
@@ -455,9 +497,10 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           )
           return
         }
-        const liveItems = await getFilteredQueue()
-        const item = liveItems.find((i) => i.bot === bot && i.msgId === msgId)
-        const button = item?.buttons.find((b) => b.dataB64 === dataB64)
+        const rawMsg = await transport.fetchMessage(chatPeer, bot, msgId)
+        const item = rawMsg ? buildQueueItem(rawMsg, allowlist) : null
+        const matches = item?.buttons.filter((b) => b.dataB64 === dataB64) ?? []
+        const button = matches.length === 1 ? matches[0] : undefined
         if (!item || !button) {
           sendJson(
             res,
@@ -476,7 +519,17 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           )
           return
         }
-        sendJson(res, 200, issueArmToken(bot, msgId, dataB64), cors.headerValue)
+        if (!button.danger) {
+          sendJson(
+            res,
+            400,
+            { ok: false, code: 'INVALID_REQUEST', message: 'Arm token only applies to danger buttons' },
+            cors.headerValue,
+          )
+          return
+        }
+        logAudit(bot, msgId, button.label, 'arm_issued', `Armed (${button.dangerSource ?? 'policy'})`)
+        sendJson(res, 200, issueArmToken(chatPeer, bot, msgId, dataB64, item.line), cors.headerValue)
         return
       }
 
@@ -493,11 +546,12 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
 
         const body = await readJsonBody<Partial<PressRequest>>(req)
         const bot = normalizeBotHandle(typeof body.bot === 'string' ? body.bot : '')
+        const chatPeer = normalizeChatPeer(typeof body.chatPeer === 'string' ? body.chatPeer : '') ?? bot
         const msgId = typeof body.msgId === 'number' ? body.msgId : -1
         const dataB64 = typeof body.dataB64 === 'string' ? body.dataB64 : ''
         const dataBytes = decodeBase64ToBytes(dataB64)
 
-        if (!bot || !Number.isInteger(msgId) || msgId <= 0 || !dataBytes) {
+        if (!bot || !chatPeer || !Number.isInteger(msgId) || msgId <= 0 || !dataBytes) {
           const err: PressOutcome = {
             ok: false,
             code: 'INVALID_REQUEST',
@@ -517,10 +571,11 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           return
         }
 
-        // Gate 1: Strict allowlist check
+        // Gate 1: Strict allowlist check (bot + optional group)
         const allowlist = store.getAllowlist()
-        if (!isAllowlisted(bot, allowlist)) {
-          logAudit(bot, msgId, 'unknown', 'refused_allowlist', 'Blocked: bot not on allowlist')
+        const groups = store.getGroups()
+        if (!isAllowlisted(bot, allowlist) || (chatPeer !== bot && !isGroupAllowlisted(chatPeer, groups))) {
+          logAudit(bot, msgId, 'unknown', 'refused_allowlist', 'Blocked: bot/group not on allowlist')
           const err: PressOutcome = {
             ok: false,
             code: 'BOT_NOT_ALLOWLISTED',
@@ -530,11 +585,12 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           return
         }
 
-        // Gate 2: Inspect live inline keyboard button metadata before pressing
-        const liveItems = await getFilteredQueue()
-        const item = liveItems.find((i) => i.bot === bot && i.msgId === msgId)
-        const button = item?.buttons.find((b) => b.dataB64 === dataB64)
-        if (!item || !button) {
+        // Gate 2: Targeted live fetch of the exact target message (never stale cache)
+        const rawMsg = await transport.fetchMessage(chatPeer, bot, msgId)
+        const item = rawMsg ? buildQueueItem(rawMsg, store.getAllowlist()) : null
+        const matches = item?.buttons.filter((b) => b.dataB64 === dataB64) ?? []
+        const button = matches.length === 1 ? matches[0] : undefined
+        if (!rawMsg || !item || !button) {
           const err: PressOutcome = {
             ok: false,
             code: 'BUTTON_NOT_FOUND',
@@ -556,15 +612,17 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           return
         }
 
-        // Gate 4: Protocol-level server-enforced two-step confirmation for bg_danger
+        // Gate 4: Server-enforced two-step confirmation bound to exact live message text
         if (button.danger) {
           const hasValidArm =
             body.confirmedDanger === true &&
             consumeArmToken(
               typeof body.armToken === 'string' ? body.armToken : undefined,
+              chatPeer,
               bot,
               msgId,
               dataB64,
+              item.line,
             )
           if (!hasValidArm) {
             logAudit(
@@ -585,10 +643,17 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
         }
 
         try {
-          const pressed = await transport.pressCallback(bot, msgId, dataBytes)
+          const pressed = await transport.pressCallback(
+            chatPeer,
+            bot,
+            msgId,
+            dataBytes,
+            rawMsg.rawText,
+          )
           const editedLine = pressed.editedRawText
             ? sanitizeAlertLine(pressed.editedRawText)
             : null
+          store.markPressed(chatPeer, msgId)
           logAudit(
             bot,
             msgId,
@@ -599,6 +664,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           const okRes: PressOutcome = {
             ok: true,
             bot,
+            chatPeer,
             msgId,
             buttonLabel: button.label,
             answer: sanitizeAlertLine(pressed.answer, 48),
@@ -609,7 +675,27 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           sendJson(res, 200, okRes, cors.headerValue)
           return
         } catch (err) {
-          console.error('[bottap-gateway] pressCallback failed:', err instanceof Error ? err.message : err)
+          const rawErr = err instanceof Error ? err.message : String(err)
+          if (rawErr === 'BUTTON_NOT_FOUND') {
+            const fail: PressOutcome = {
+              ok: false,
+              code: 'BUTTON_NOT_FOUND',
+              message: 'Alert expired or button removed',
+            }
+            sendJson(res, 404, fail, cors.headerValue)
+            return
+          }
+          if (rawErr.startsWith('RATE_LIMITED:')) {
+            const secs = rawErr.split(':')[1] || '30'
+            const fail: PressOutcome = {
+              ok: false,
+              code: 'RATE_LIMITED',
+              message: `Telegram flood wait — retry in ${secs}s`,
+            }
+            sendJson(res, 429, fail, cors.headerValue)
+            return
+          }
+          console.error('[bottap-gateway] pressCallback failed:', rawErr)
           const fail: PressOutcome = {
             ok: false,
             code: 'TRANSPORT_ERROR',
@@ -620,7 +706,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
         }
       }
 
-      // Allowlist management
+      // Allowlist management (audited)
       if (method === 'GET' && pathname === '/allowlist') {
         sendJson(res, 200, { ok: true, allowlist: store.getAllowlist() }, cors.headerValue)
         return
@@ -639,20 +725,70 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           return
         }
         const allowlist = store.addAllowlist(norm)
+        logAudit(norm, 0, 'allowlist', 'allowlist_add', `Added @${norm}`)
         sendJson(res, 200, { ok: true, allowlist }, cors.headerValue)
         return
       }
 
       if (method === 'DELETE' && pathname.startsWith('/allowlist/')) {
         const target = decodeURIComponent(pathname.slice('/allowlist/'.length))
+        const norm = normalizeBotHandle(target) ?? target
         const allowlist = store.removeAllowlist(target)
+        logAudit(norm, 0, 'allowlist', 'allowlist_remove', `Removed @${norm}`)
         sendJson(res, 200, { ok: true, allowlist }, cors.headerValue)
         return
       }
 
-      // Self-hosted pairing endpoints (rate-limited; session stays strictly on user's gateway)
+      // Ops group allowlist management (audited)
+      if (method === 'GET' && pathname === '/groups') {
+        sendJson(res, 200, { ok: true, groups: store.getGroups() }, cors.headerValue)
+        return
+      }
+
+      if (method === 'POST' && pathname === '/groups') {
+        const body = await readJsonBody<{ group?: string }>(req)
+        const norm = normalizeChatPeer(body.group ?? '')
+        if (!norm) {
+          sendJson(
+            res,
+            400,
+            { ok: false, message: 'Valid group username or numeric chat ID required' },
+            cors.headerValue,
+          )
+          return
+        }
+        const groups = store.addGroup(norm)
+        logAudit(norm, 0, 'groups', 'allowlist_add', `Added group ${norm}`)
+        sendJson(res, 200, { ok: true, groups }, cors.headerValue)
+        return
+      }
+
+      if (method === 'DELETE' && pathname.startsWith('/groups/')) {
+        const target = decodeURIComponent(pathname.slice('/groups/'.length))
+        const groups = store.removeGroup(target)
+        logAudit(target, 0, 'groups', 'allowlist_remove', `Removed group ${target}`)
+        sendJson(res, 200, { ok: true, groups }, cors.headerValue)
+        return
+      }
+
+      // Self-hosted pairing endpoints (separate poll bucket from sensitive write bucket)
+      if (method === 'GET' && pathname === '/pairing/qr') {
+        if (!limiter.allow(`qr-poll:${ip}`, 45)) {
+          sendJson(
+            res,
+            429,
+            { ok: false, code: 'RATE_LIMITED', message: 'QR poll rate limit reached, retry shortly' },
+            cors.headerValue,
+          )
+          return
+        }
+        const pairing = await transport.pollQrPairing()
+        sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
+        return
+      }
+
       if (pathname.startsWith('/pairing/')) {
-        if (!limiter.allow(`pairing:${ip}`, 15)) {
+        if (!limiter.allow(`pairing:${ip}`, 12)) {
           sendJson(
             res,
             429,
@@ -665,11 +801,6 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
 
       if (method === 'POST' && pathname === '/pairing/qr') {
         const pairing = await transport.startQrPairing()
-        sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
-        return
-      }
-      if (method === 'GET' && pathname === '/pairing/qr') {
-        const pairing = await transport.pollQrPairing()
         sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
         return
       }
@@ -693,6 +824,8 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
       }
       if (method === 'POST' && pathname === '/pairing/disconnect') {
         const pairing = await transport.disconnect()
+        armedTokens.clear()
+        store.clearTombstones()
         sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
         return
       }
@@ -705,6 +838,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
       ) {
         transport.resetDemo()
         armedTokens.clear()
+        store.clearTombstones()
         sendJson(res, 200, { ok: true, mode: 'demo' }, cors.headerValue)
         return
       }

@@ -500,6 +500,21 @@ textarea {
 }
 
 /* Queue ruled ledger */
+.scan-warning {
+  margin: 0 0 var(--space-sm);
+  padding: var(--space-xs) var(--space-sm);
+  border: var(--rule-hair) solid var(--color-signal-warn);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-signal-warn-wash);
+  color: var(--color-signal-warn);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.scan-warning[hidden] {
+  display: none;
+}
+
 .queue-list {
   list-style: none;
   margin: 0;
@@ -552,11 +567,25 @@ textarea {
   gap: var(--space-sm);
 }
 
+.queue-bot-group {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
 .queue-bot {
   font-family: var(--font-display);
   font-size: var(--text-md);
   font-weight: 600;
   color: var(--color-ink);
+}
+
+.queue-scope {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-muted);
 }
 
 .queue-age {
@@ -761,8 +790,14 @@ textarea {
   color: var(--color-signal-ok);
 }
 
-.audit-status[data-outcome="timeout"] {
+.audit-status[data-outcome="timeout"],
+.audit-status[data-outcome="arm_issued"] {
   color: var(--color-signal-warn);
+}
+
+.audit-status[data-outcome="allowlist_add"],
+.audit-status[data-outcome="allowlist_remove"] {
+  color: var(--color-ink-2);
 }
 
 .audit-status[data-outcome="refused_2fa"],
@@ -862,6 +897,10 @@ dialog.gateway-dialog::backdrop {
   display: flex;
   flex-direction: column;
   gap: var(--space-sm);
+}
+
+.dialog-section[hidden] {
+  display: none;
 }
 
 .field-group {

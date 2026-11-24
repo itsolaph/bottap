@@ -107,6 +107,7 @@ Connecting to self-hosted gateway…</pre>
           <div class="panels-stack">
             <div id="panel-queue" role="tabpanel" aria-labelledby="tab-queue" tabindex="0">
               <div class="panel-body">
+                <p id="scan-warning" class="scan-warning" hidden role="alert"></p>
                 <ul id="queue-list" class="queue-list"></ul>
                 <p id="queue-empty" class="empty-note">Waiting for allowlisted bots with inline callback buttons.</p>
                 <div class="policy-strip" aria-label="Protocol safety boundaries">
@@ -166,7 +167,7 @@ Connecting to self-hosted gateway…</pre>
 
       <footer class="foot">
         <p>
-          Unofficial Telegram API client running against your own self-hosted gateway. Sessions stay on your machine. No chat lists, no message bodies, no free-text sending, and no AI training on Telegram data.
+          Unofficial Telegram API client running against your own self-hosted gateway. Sessions stay on your machine. No chat lists, no full message history, no free-text sending, and no AI training on Telegram data.
         </p>
       </footer>
 

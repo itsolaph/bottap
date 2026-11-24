@@ -24,16 +24,45 @@ import {
   type GatewayMode,
   type GatewayStatus,
   type QueueItem,
+  type ScanDiagnostic,
 } from '@bottap/shared'
-import { GatewayClient, isSecureOrLoopbackUrl } from './client'
+import { GatewayClient, isSecureOrLoopbackUrl, type BotTapGatewayApi } from './client'
 import { renderG2Frame, type G2Frame } from './g2-renderer'
 import { createQrSvgElement } from './qr-svg'
+import { BrowserSandboxClient } from './sandbox-client'
 
 const STORAGE_URL_KEY = 'bottap.gatewayUrl'
 const STORAGE_TOKEN_KEY = 'bottap.gatewayToken'
+const QR_POLL_INTERVAL_MS = 4000
+const QR_POLL_MAX_ATTEMPTS = 38 // ~2.5 minutes cap
+
+function safeStorageGet(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function safeStorageSet(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value)
+  } catch {
+    // Private/restricted WebViews may disallow localStorage; keep config in memory
+  }
+}
+
+function shouldUseBrowserSandbox(): boolean {
+  if (import.meta.env.VITE_BOTTAP_SANDBOX === '1') return true
+  try {
+    return new URLSearchParams(window.location.search).get('sandbox') === '1'
+  } catch {
+    return false
+  }
+}
 
 function defaultGatewayUrl(): string {
-  const saved = window.localStorage.getItem(STORAGE_URL_KEY)
+  const saved = safeStorageGet(STORAGE_URL_KEY)
   if (saved) return saved
   if (window.location.port === '5173') {
     return `${window.location.origin}/api`
@@ -41,21 +70,31 @@ function defaultGatewayUrl(): string {
   return window.location.origin
 }
 
-const client = new GatewayClient({
-  baseUrl: defaultGatewayUrl(),
-  token: window.localStorage.getItem(STORAGE_TOKEN_KEY) ?? '',
-})
+const client: BotTapGatewayApi = shouldUseBrowserSandbox()
+  ? new BrowserSandboxClient()
+  : new GatewayClient({
+      baseUrl: defaultGatewayUrl(),
+      token: safeStorageGet(STORAGE_TOKEN_KEY) ?? '',
+    })
 
 let bridge: EvenAppBridge | null = null
 let bridgeReady = false
 let g2State: G2ViewState = initialG2State()
 let lastStatus: GatewayStatus | null = null
 let lastItems: readonly QueueItem[] = []
-let lastMeta: { allowlistCount: number; mode: GatewayMode } = {
+let lastDiagnostics: readonly ScanDiagnostic[] = []
+let lastMeta: {
+  allowlistCount: number
+  mode: GatewayMode
+  scanDiagnostics: readonly ScanDiagnostic[]
+} = {
   allowlistCount: 0,
   mode: 'live',
+  scanDiagnostics: [],
 }
 let lastRenderedLensKey = ''
+let lastSentBody = ''
+let lastSentFooter = ''
 let lastQueueKey = ''
 let lastAllowlistKey = ''
 let lastAuditKey = ''
@@ -63,13 +102,30 @@ let lastPairingKey = ''
 let lastAnnounced = ''
 let bridgeWriteQueue: Promise<unknown> = Promise.resolve()
 let qrPollTimer: number | null = null
+let qrPollAttempts = 0
 let activeQrUrl: string | null = null
 let pendingArm: { key: string; promise: Promise<string | null> } | null = null
+let refreshInFlight = false
+let tickTimer: number | null = null
+let pollTimer: number | null = null
 
 function stopQrPoll(): void {
   if (qrPollTimer !== null) {
     window.clearInterval(qrPollTimer)
     qrPollTimer = null
+  }
+  qrPollAttempts = 0
+}
+
+function stopBackgroundTimers(): void {
+  stopQrPoll()
+  if (tickTimer !== null) {
+    window.clearInterval(tickTimer)
+    tickTimer = null
+  }
+  if (pollTimer !== null) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
   }
 }
 
@@ -121,23 +177,36 @@ function pushFrameToG2(frame: G2Frame): void {
 
   if (!bridge || !bridgeReady) return
 
+  const bodyChanged = frame.body !== lastSentBody
+  const footerChanged = frame.footer !== lastSentFooter
+  if (!bodyChanged && !footerChanged) return
+
   const activeBridge = bridge
+  const nextBody = frame.body
+  const nextFooter = frame.footer
+  if (bodyChanged) lastSentBody = nextBody
+  if (footerChanged) lastSentFooter = nextFooter
+
   bridgeWriteQueue = bridgeWriteQueue
     .then(async () => {
-      await activeBridge.textContainerUpgrade(
-        new TextContainerUpgrade({
-          containerID: 1,
-          containerName: 'body',
-          content: frame.body,
-        }),
-      )
-      await activeBridge.textContainerUpgrade(
-        new TextContainerUpgrade({
-          containerID: 2,
-          containerName: 'footer',
-          content: frame.footer,
-        }),
-      )
+      if (bodyChanged) {
+        await activeBridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: 1,
+            containerName: 'body',
+            content: nextBody,
+          }),
+        )
+      }
+      if (footerChanged) {
+        await activeBridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: 2,
+            containerName: 'footer',
+            content: nextFooter,
+          }),
+        )
+      }
     })
     .catch((err) => console.error('[bottap] G2 upgrade failed:', err))
 }
@@ -199,7 +268,11 @@ function renderTopStatus(): void {
   const dialogSpec = el('dialog-spec')
 
   if (!readout || !label) return
-  if (!lastStatus) {
+  if (client.isBrowserSandbox) {
+    readout.setAttribute('data-state', 'demo')
+    label.textContent = 'Browser sandbox'
+    if (dialogSpec) dialogSpec.textContent = 'In-browser sandbox (no Telegram connection)'
+  } else if (!lastStatus) {
     readout.setAttribute('data-state', 'offline')
     label.textContent = 'Offline'
     if (dialogSpec) dialogSpec.textContent = 'Gateway offline'
@@ -239,18 +312,38 @@ function activeFocusedInfo(): { itemId: string | null; armedButtonB64: string | 
 function renderQueuePanel(): void {
   const listEl = el<HTMLUListElement>('queue-list')
   const emptyEl = el('queue-empty')
+  const warnEl = el('scan-warning')
   const tabCount = el('tab-count-queue')
   if (!listEl || !emptyEl) return
 
   if (tabCount) tabCount.textContent = String(lastItems.length)
   emptyEl.hidden = lastItems.length > 0
 
+  if (warnEl) {
+    if (lastDiagnostics.length > 0) {
+      const first = lastDiagnostics[0]!
+      const extra = lastDiagnostics.length > 1 ? ` (+${lastDiagnostics.length - 1} more)` : ''
+      warnEl.hidden = false
+      warnEl.textContent = `Scan warning (${first.target}): ${first.error}${extra}`
+    } else {
+      warnEl.hidden = true
+      warnEl.textContent = ''
+    }
+  }
+
   const { itemId: focusedId, armedButtonB64 } = activeFocusedInfo()
   const now = Date.now()
   const queueKey = JSON.stringify({
     focusedId,
     armedButtonB64,
-    items: lastItems.map((i) => [i.id, i.line, formatRelativeAge(i.sentAt, now), i.buttons.length]),
+    items: lastItems.map((i) => [
+      i.id,
+      i.line,
+      i.chatTitle ?? '',
+      formatRelativeAge(i.sentAt, now),
+      i.buttons.length,
+      i.hiddenOverflowCount,
+    ]),
   })
   if (queueKey === lastQueueKey) return
   lastQueueKey = queueKey
@@ -274,15 +367,26 @@ function renderQueuePanel(): void {
       const head = document.createElement('div')
       head.className = 'queue-row-head'
 
+      const botGroup = document.createElement('span')
+      botGroup.className = 'queue-bot-group'
+
       const botSpan = document.createElement('span')
       botSpan.className = 'queue-bot'
       botSpan.textContent = `@${item.bot}`
+      botGroup.append(botSpan)
+
+      if (item.chatTitle) {
+        const scopeSpan = document.createElement('span')
+        scopeSpan.className = 'queue-scope'
+        scopeSpan.textContent = item.chatTitle
+        botGroup.append(scopeSpan)
+      }
 
       const ageSpan = document.createElement('span')
       ageSpan.className = 'queue-age'
       ageSpan.textContent = formatRelativeAge(item.sentAt, now)
 
-      head.append(botSpan, ageSpan)
+      head.append(botGroup, ageSpan)
 
       const lineP = document.createElement('p')
       lineP.className = 'queue-line'
@@ -302,11 +406,11 @@ function renderQueuePanel(): void {
               ? 'signal-tag signal-tag--danger'
               : 'signal-tag'
         tag.textContent = thisArmed
-          ? `${cb.label}: Press again`
+          ? `${cb.label}: Tap Confirm`
           : cb.requiresPassword
             ? `${cb.label} (2FA blocked)`
             : cb.danger
-              ? `${cb.label} (2x tap)`
+              ? `${cb.label} (arm + tap)`
               : cb.label
         signals.append(tag)
       }
@@ -316,6 +420,13 @@ function renderQueuePanel(): void {
         stripped.className = 'signal-tag signal-tag--stripped'
         stripped.textContent = `${item.hiddenNonCallbackCount} non-callback stripped`
         signals.append(stripped)
+      }
+
+      if (item.hiddenOverflowCount > 0) {
+        const overflow = document.createElement('span')
+        overflow.className = 'signal-tag signal-tag--stripped'
+        overflow.textContent = `+${item.hiddenOverflowCount} more in Telegram`
+        signals.append(overflow)
       }
 
       btn.append(head, lineP, signals)
@@ -333,19 +444,25 @@ function renderAllowlistPanel(): void {
   if (!rowsEl) return
 
   const allowlist = lastStatus?.allowlist ?? []
+  const groupsCount = lastStatus?.groups?.length ?? 0
   if (tabCount) tabCount.textContent = String(allowlist.length)
-  if (resetBtn) resetBtn.hidden = lastStatus?.mode !== 'demo'
+  if (resetBtn) {
+    resetBtn.hidden = !client.isBrowserSandbox && lastStatus?.mode !== 'demo'
+    resetBtn.textContent = client.isBrowserSandbox ? 'Reset sandbox' : 'Reset demo'
+  }
 
-  const allowKey = `${lastStatus?.mode ?? ''}|${lastStatus?.pairing.status ?? ''}|${allowlist.join(',')}`
+  const allowKey = `${client.isBrowserSandbox}|${lastStatus?.mode ?? ''}|${lastStatus?.pairing.status ?? ''}|${groupsCount}|${allowlist.join(',')}`
   if (allowKey === lastAllowlistKey) return
   lastAllowlistKey = allowKey
 
   if (modeNote) {
-    modeNote.textContent =
-      lastStatus?.mode === 'demo'
-        ? 'Offline sandbox fixtures active'
+    const groupSuffix = groupsCount > 0 ? ` · ${groupsCount} ops group` : ''
+    modeNote.textContent = client.isBrowserSandbox
+      ? `In-browser sandbox (no Telegram connection)${groupSuffix}`
+      : lastStatus?.mode === 'demo'
+        ? `Offline sandbox fixtures active${groupSuffix}`
         : lastStatus?.pairing.status === 'paired'
-          ? 'Live MTProto Layer 234'
+          ? `Live MTProto Layer 234${groupSuffix}`
           : ''
   }
 
@@ -363,8 +480,16 @@ function renderAllowlistPanel(): void {
       rm.className = 'key key--quiet'
       rm.textContent = 'Remove'
       rm.addEventListener('click', async () => {
-        await client.removeAllowlist(bot)
-        await refreshFromGateway()
+        try {
+          await client.removeAllowlist(bot)
+          await refreshFromGateway()
+        } catch (err) {
+          const hint = el('allowlist-hint')
+          if (hint) {
+            hint.dataset.error = 'true'
+            hint.textContent = err instanceof Error ? err.message : 'Failed to remove bot'
+          }
+        }
       })
 
       li.append(handle, rm)
@@ -418,7 +543,33 @@ function renderPairingModalState(): void {
   const controls = el('pairing-controls')
   const feedback = el('pairing-feedback')
   const demoDetails = el('demo-env-details')
+  const gatewayForm = el('form-gateway')
   if (!statusText || !controls) return
+
+  if (gatewayForm) {
+    gatewayForm.hidden = client.isBrowserSandbox
+  }
+
+  if (client.isBrowserSandbox) {
+    statusText.textContent =
+      'Running deterministic in-browser sandbox fixtures. No Telegram account or network gateway is connected.'
+    if (demoDetails) demoDetails.hidden = false
+    if (lastPairingKey !== 'browser-sandbox') {
+      lastPairingKey = 'browser-sandbox'
+      stopQrPoll()
+      const resetBtn = document.createElement('button')
+      resetBtn.type = 'button'
+      resetBtn.className = 'key'
+      resetBtn.textContent = 'Reset sandbox fixtures'
+      resetBtn.addEventListener('click', async () => {
+        await client.resetDemo()
+        if (feedback) feedback.textContent = 'Sandbox alerts restored.'
+        await refreshFromGateway()
+      })
+      controls.replaceChildren(resetBtn)
+    }
+    return
+  }
 
   const pairing = lastStatus?.pairing
   const effectiveQrUrl =
@@ -484,12 +635,22 @@ function renderPairingModalState(): void {
       const res = await client.startQrPairing()
       activeQrUrl = res.pairing.qrUrl ?? null
       if (feedback) {
-        feedback.textContent = res.pairing.error || 'Scan QR in Telegram: Settings -> Devices -> Link Desktop Device.'
+        feedback.textContent =
+          res.pairing.error || 'Scan QR in Telegram: Settings -> Devices -> Link Desktop Device.'
       }
       await refreshFromGateway()
       stopQrPoll()
       if (res.pairing.status === 'qr_pending') {
+        qrPollAttempts = 0
         qrPollTimer = window.setInterval(async () => {
+          qrPollAttempts += 1
+          if (qrPollAttempts > QR_POLL_MAX_ATTEMPTS) {
+            stopQrPoll()
+            if (feedback) {
+              feedback.textContent = 'QR login expired. Click Refresh QR to generate a new code.'
+            }
+            return
+          }
           try {
             const polled = await client.pollQrPairing()
             activeQrUrl = polled.pairing.qrUrl ?? null
@@ -501,10 +662,14 @@ function renderPairingModalState(): void {
               if (feedback) feedback.textContent = 'Enter your Telegram 2FA cloud password below.'
             }
             await refreshFromGateway()
-          } catch {
+          } catch (err) {
             stopQrPoll()
+            if (feedback) {
+              feedback.textContent =
+                err instanceof Error ? err.message : 'QR status check failed — click Refresh QR.'
+            }
           }
-        }, 3000)
+        }, QR_POLL_INTERVAL_MS)
       }
     } catch (err) {
       if (feedback) feedback.textContent = err instanceof Error ? err.message : 'QR pairing failed'
@@ -664,6 +829,7 @@ function syncUI(): void {
 
 function dispatch(action: G2Action): void {
   const { state, effect } = reduceG2State(g2State, action, lastMeta)
+  if (state === g2State && !effect) return
   g2State = state
   if (state.screen !== 'danger_confirm' && state.screen !== 'pressing') {
     pendingArm = null
@@ -680,11 +846,20 @@ function dispatch(action: G2Action): void {
     return
   }
   if (effect.type === 'ARM_DANGER') {
-    const key = `${effect.req.bot}:${effect.req.msgId}:${effect.req.dataB64}`
+    const key = `${effect.req.chatPeer ?? effect.req.bot}:${effect.req.bot}:${effect.req.msgId}:${effect.req.dataB64}`
     const promise = client
       .armDanger(effect.req)
       .then((res) => res.armToken)
-      .catch(() => null)
+      .catch((err) => {
+        if (pendingArm?.key === key && g2State.screen === 'danger_confirm') {
+          dispatch({
+            type: 'ARM_FAILED',
+            message: err instanceof Error ? err.message : 'Could not arm action',
+            now: Date.now(),
+          })
+        }
+        return null
+      })
     pendingArm = { key, promise }
     return
   }
@@ -695,12 +870,24 @@ function dispatch(action: G2Action): void {
       try {
         let req = effect.req
         if (req.confirmedDanger) {
-          const key = `${req.bot}:${req.msgId}:${req.dataB64}`
+          const key = `${req.chatPeer ?? req.bot}:${req.bot}:${req.msgId}:${req.dataB64}`
           const armToken =
             armForPress && armForPress.key === key ? await armForPress.promise : null
-          if (armToken) {
-            req = { ...req, armToken }
+          if (!armToken) {
+            if (g2State.screen === 'pressing') {
+              dispatch({
+                type: 'PRESS_DONE',
+                now: Date.now(),
+                outcome: {
+                  ok: false,
+                  code: 'DANGER_CONFIRMATION_REQUIRED',
+                  message: 'Could not obtain arm token — retry',
+                },
+              })
+            }
+            return
           }
+          req = { ...req, armToken }
         }
         const outcome = await client.press(req)
         dispatch({ type: 'PRESS_DONE', outcome, now: Date.now() })
@@ -720,13 +907,17 @@ function dispatch(action: G2Action): void {
 }
 
 async function refreshFromGateway(): Promise<void> {
+  if (refreshInFlight) return
+  refreshInFlight = true
   try {
     const [status, pending] = await Promise.all([client.getStatus(), client.getPending()])
     lastStatus = status
     lastItems = pending.items
+    lastDiagnostics = pending.scanDiagnostics ?? status.scanDiagnostics ?? []
     lastMeta = {
       allowlistCount: status.allowlist.length,
       mode: status.mode,
+      scanDiagnostics: lastDiagnostics,
     }
     dispatch({
       type: 'SYNC_OK',
@@ -734,14 +925,18 @@ async function refreshFromGateway(): Promise<void> {
       mode: pending.mode,
       allowlistCount: pending.allowlist.length,
       items: pending.items,
+      scanDiagnostics: lastDiagnostics,
     })
   } catch (err) {
     lastStatus = null
     lastItems = []
+    lastDiagnostics = []
     dispatch({
       type: 'SYNC_ERROR',
       message: err instanceof Error ? err.message : 'Gateway unreachable',
     })
+  } finally {
+    refreshInFlight = false
   }
 }
 
@@ -835,6 +1030,7 @@ function setupGatewayDialog(): void {
   })
 
   testBtn?.addEventListener('click', async () => {
+    if (client.isBrowserSandbox) return
     const base = (urlInput?.value.trim() || client.getConfig().baseUrl).replace(/\/+$/, '')
     const t0 = performance.now()
     if (pingOut) {
@@ -875,6 +1071,7 @@ function setupGatewayDialog(): void {
 
   el('form-gateway')?.addEventListener('submit', (ev) => {
     ev.preventDefault()
+    if (client.isBrowserSandbox) return
     const url = urlInput?.value.trim()
     const tok = tokenInput?.value.trim() ?? ''
     if (!url) return
@@ -885,8 +1082,8 @@ function setupGatewayDialog(): void {
       }
       return
     }
-    window.localStorage.setItem(STORAGE_URL_KEY, url)
-    window.localStorage.setItem(STORAGE_TOKEN_KEY, tok)
+    safeStorageSet(STORAGE_URL_KEY, url)
+    safeStorageSet(STORAGE_TOKEN_KEY, tok)
     client.configure({ baseUrl: url, token: tok })
     dialog.close('saved')
     void refreshFromGateway()
@@ -928,12 +1125,15 @@ function setupControls(): void {
   })
 
   window.addEventListener('keydown', (ev) => {
+    if (ev.repeat) return
     const dialog = el<HTMLDialogElement>('gateway-dialog')
     if (dialog?.open) return
+    const target = ev.target
     if (
-      ev.target instanceof HTMLInputElement ||
-      ev.target instanceof HTMLTextAreaElement ||
-      (ev.target instanceof HTMLElement && ev.target.closest('#tablist'))
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target instanceof HTMLSelectElement ||
+      (target instanceof HTMLElement && target.closest('#tablist'))
     ) {
       return
     }
@@ -944,6 +1144,10 @@ function setupControls(): void {
       ev.preventDefault()
       dispatch({ type: 'SCROLL_DOWN' })
     } else if (ev.key === 'Enter' || ev.key === ' ') {
+      // Do not hijack native activation when focus is on an interactive control
+      if (target instanceof HTMLElement && target.closest('button, a, summary')) {
+        return
+      }
       ev.preventDefault()
       dispatch({ type: 'TAP', now: Date.now() })
     } else if (ev.key === 'Escape' || ev.key === 'Backspace') {
@@ -1002,6 +1206,8 @@ async function initEvenBridge(): Promise<void> {
     if (res === 0) {
       bridgeReady = true
       lastRenderedLensKey = `${initialFrame.body}\u0000${initialFrame.footer}`
+      lastSentBody = initialFrame.body
+      lastSentFooter = initialFrame.footer
     }
 
     const unsubscribe = bridge.onEvenHubEvent((event) => {
@@ -1032,11 +1238,15 @@ async function initEvenBridge(): Promise<void> {
         sysType === OsEventTypeList.SYSTEM_EXIT_EVENT ||
         sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT
       ) {
+        stopBackgroundTimers()
         unsubscribe()
       }
     })
 
-    window.addEventListener('beforeunload', () => unsubscribe())
+    window.addEventListener('beforeunload', () => {
+      stopBackgroundTimers()
+      unsubscribe()
+    })
   } catch (err) {
     console.warn('[bottap] Even Hub bridge not active (standalone browser mode):', err)
   }
@@ -1050,12 +1260,18 @@ syncUI()
 void initEvenBridge()
 void refreshFromGateway()
 
-window.setInterval(() => {
+tickTimer = window.setInterval(() => {
   dispatch({ type: 'TICK', now: Date.now() })
 }, 500)
 
-window.setInterval(() => {
-  if (g2State.screen === 'queue' || g2State.screen === 'empty' || g2State.screen === 'unpaired') {
+pollTimer = window.setInterval(() => {
+  if (
+    g2State.screen === 'queue' ||
+    g2State.screen === 'empty' ||
+    g2State.screen === 'unpaired' ||
+    g2State.screen === 'offline' ||
+    g2State.screen === 'loading'
+  ) {
     void refreshFromGateway()
   }
 }, 5000)

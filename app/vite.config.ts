@@ -1,6 +1,9 @@
 import { defineConfig } from 'vite'
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
+  define: {
+    'import.meta.env.VITE_BOTTAP_SANDBOX': JSON.stringify(mode === 'sandbox' ? '1' : ''),
+  },
   server: {
     host: '127.0.0.1',
     port: 5173,
@@ -15,4 +18,4 @@ export default defineConfig({
   build: {
     target: 'esnext',
   },
-})
+}))

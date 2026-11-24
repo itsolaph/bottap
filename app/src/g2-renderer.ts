@@ -7,10 +7,11 @@ export interface G2Frame {
 
 const MAX_LINE_LEN = 44
 
-function fitLine(text: string, maxLen = MAX_LINE_LEN): string {
-  const clean = text.replace(/\s+/g, ' ').trim()
-  if (clean.length <= maxLen) return clean
-  return clean.slice(0, maxLen - 3).trimEnd() + '...'
+function fitLine(text: string | undefined, maxLen = MAX_LINE_LEN): string {
+  const clean = (text ?? '').replace(/\s+/g, ' ').trim()
+  const chars = Array.from(clean)
+  if (chars.length <= maxLen) return clean
+  return chars.slice(0, maxLen - 3).join('').trimEnd() + '...'
 }
 
 export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
@@ -43,7 +44,19 @@ export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
         footer: 'tap: refresh  ·  2x: exit',
       }
 
-    case 'empty':
+    case 'empty': {
+      const diag = state.scanDiagnostics[0]
+      if (diag) {
+        return {
+          body: [
+            `BOTTAP · SCAN WARNING${state.mode === 'demo' ? ' [DEMO]' : ''}`,
+            '',
+            fitLine(`${diag.target}: ${diag.error}`),
+            'Check handle or /start bot in Telegram.',
+          ].join('\n'),
+          footer: 'tap: retry  ·  2x: exit',
+        }
+      }
       return {
         body: [
           `BOTTAP · 0 PENDING${state.mode === 'demo' ? ' [DEMO]' : ''}`,
@@ -53,6 +66,7 @@ export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
         ].join('\n'),
         footer: 'tap: refresh  ·  2x: exit',
       }
+    }
 
     case 'queue': {
       const total = state.items.length
@@ -71,7 +85,8 @@ export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
         const isCurrent = i === state.cursor
         const prefix = isCurrent ? '> ' : '  '
         const btnTag = `${item.buttons.length}b`
-        lines.push(fitLine(`${prefix}@${item.bot} · ${age} · ${btnTag}`))
+        const scope = item.chatTitle ? ` (${item.chatTitle})` : ''
+        lines.push(fitLine(`${prefix}@${item.bot}${scope} · ${age} · ${btnTag}`))
         if (isCurrent) {
           lines.push(fitLine(`  ${item.line}`))
         }
@@ -86,8 +101,9 @@ export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
     case 'buttons': {
       const item = state.items[state.itemIndex]!
       const age = formatRelativeAge(item.sentAt, nowMs)
+      const scope = item.chatTitle ? ` · ${item.chatTitle}` : ''
       const lines: string[] = [
-        fitLine(`@${item.bot} · ${age}`),
+        fitLine(`@${item.bot}${scope} · ${age}`),
         fitLine(item.line),
         '',
       ]
@@ -108,7 +124,7 @@ export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
           : btn.danger
             ? '[!] '
             : '[ ] '
-        const hint = btn.danger && !btn.requiresPassword ? ' (2x)' : ''
+        const hint = btn.danger && !btn.requiresPassword ? ' (arm)' : ''
         lines.push(fitLine(`${cursor}${badge}${btn.label}${hint}`))
       }
 
@@ -128,7 +144,7 @@ export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
           fitLine(item.line),
           '',
           fitLine(`Action: ${btn.label}`),
-          '>>> PRESS AGAIN TO CONFIRM <<<',
+          '>>> TAP AGAIN TO CONFIRM <<<',
         ].join('\n'),
         footer: 'tap: CONFIRM  ·  swipe/2x: cancel',
       }
@@ -145,19 +161,25 @@ export function renderG2Frame(state: G2ViewState, nowMs = Date.now()): G2Frame {
         footer: 'Waiting for bot callback answer...',
       }
 
-    case 'result':
+    case 'result': {
+      const headerTag = state.timedOut
+        ? 'NO ANSWER (LOGGED)'
+        : state.ok
+          ? 'BOT ANSWERED'
+          : 'NOT EXECUTED'
       return {
         body: [
-          fitLine(`${state.timedOut ? 'LOGGED (TIMEOUT)' : 'CONFIRMED'} · @${state.bot}`),
+          fitLine(`${headerTag} · @${state.bot}`),
           fitLine(`Button: ${state.buttonLabel}`),
           '',
           fitLine(state.headline),
-          state.detail !== state.headline ? fitLine(state.detail) : '',
+          state.detail && state.detail !== state.headline ? fitLine(state.detail) : '',
         ]
           .filter((l, idx) => idx === 2 || l.length > 0)
           .join('\n'),
         footer: 'Returning to queue...  ·  tap: now',
       }
+    }
 
     case 'refusal':
       return {

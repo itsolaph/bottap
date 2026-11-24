@@ -1,9 +1,16 @@
-import { normalizeBotHandle, type PairingState, type RawBotMessage } from '@bottap/shared'
-import type { BotTransport, CallbackPressResult } from './transport.js'
+import {
+  normalizeBotHandle,
+  normalizeChatPeer,
+  type PairingState,
+  type RawBotMessage,
+} from '@bottap/shared'
+import type { BotTransport, CallbackPressResult, ScanResult } from './transport.js'
 
 interface DemoRecord {
   botHandle: string
   botTitle: string
+  chatPeer?: string
+  chatTitle?: string
   msgId: number
   rawText: string
   sentAt: number
@@ -27,18 +34,18 @@ function createInitialDemoRecords(now: number): DemoRecord[] {
       sentAt: now - 3 * 60_000,
       buttons: [
         {
-          typeName: 'KeyboardButtonCallback',
+          typeName: 'InlineButtonTypeCallback',
           text: 'Ack',
           data: 'uptime:ack:4101',
           style: { bgSuccess: true },
         },
         {
-          typeName: 'KeyboardButtonCallback',
+          typeName: 'InlineButtonTypeCallback',
           text: 'Mute 1h',
           data: 'uptime:mute1h:4101',
         },
         {
-          typeName: 'KeyboardButtonUrl',
+          typeName: 'InlineButtonTypeUrl',
           text: 'Open Grafana',
           data: 'https://grafana.internal/d/api-01',
         },
@@ -52,18 +59,18 @@ function createInitialDemoRecords(now: number): DemoRecord[] {
       sentAt: now - 11 * 60_000,
       buttons: [
         {
-          typeName: 'KeyboardButtonCallback',
+          typeName: 'InlineButtonTypeCallback',
           text: 'Approve Prod',
           data: 'deploy:approve:8209',
           style: { bgDanger: true },
         },
         {
-          typeName: 'KeyboardButtonCallback',
+          typeName: 'InlineButtonTypeCallback',
           text: 'Hold',
           data: 'deploy:hold:8209',
         },
         {
-          typeName: 'KeyboardButtonWebView',
+          typeName: 'InlineButtonTypeWebView',
           text: 'Inspect Diff',
           data: 'https://ci.internal/diff/8209',
         },
@@ -77,14 +84,14 @@ function createInitialDemoRecords(now: number): DemoRecord[] {
       sentAt: now - 28 * 60_000,
       buttons: [
         {
-          typeName: 'KeyboardButtonCallback',
+          typeName: 'InlineButtonTypeCallback',
           text: 'Rotate Key',
           data: 'vault:rotate:9055',
           requiresPassword: true,
           style: { bgDanger: true },
         },
         {
-          typeName: 'KeyboardButtonCallback',
+          typeName: 'InlineButtonTypeCallback',
           text: 'Defer 24h',
           data: 'vault:defer:9055',
         },
@@ -99,7 +106,7 @@ function createInitialDemoRecords(now: number): DemoRecord[] {
       sentAt: now - 60_000,
       buttons: [
         {
-          typeName: 'KeyboardButtonCallback',
+          typeName: 'InlineButtonTypeCallback',
           text: 'Claim',
           data: 'promo:claim:777',
         },
@@ -163,31 +170,59 @@ export class DemoBotTransport implements BotTransport {
     return this.getPairingState()
   }
 
-  async scanPending(allowlist: readonly string[]): Promise<RawBotMessage[]> {
-    if (!this.paired) return []
+  private toRaw(r: DemoRecord): RawBotMessage {
+    return {
+      botHandle: r.botHandle,
+      botTitle: r.botTitle,
+      chatPeer: r.chatPeer ?? r.botHandle,
+      chatTitle: r.chatTitle,
+      msgId: r.msgId,
+      rawText: r.rawText,
+      sentAt: r.sentAt,
+      buttons: r.buttons,
+    }
+  }
+
+  async scanPending(allowlist: readonly string[]): Promise<ScanResult> {
+    if (!this.paired) return { items: [], diagnostics: [] }
     const allowedSet = new Set(allowlist.map((h) => normalizeBotHandle(h)).filter(Boolean))
-    return this.records
-      .filter((r) => allowedSet.has(r.botHandle) && r.buttons.length > 0)
-      .map((r) => ({
-        botHandle: r.botHandle,
-        botTitle: r.botTitle,
-        msgId: r.msgId,
-        rawText: r.rawText,
-        sentAt: r.sentAt,
-        buttons: r.buttons,
-      }))
+    return {
+      items: this.records
+        .filter((r) => allowedSet.has(r.botHandle) && r.buttons.length > 0)
+        .map((r) => this.toRaw(r)),
+      diagnostics: [],
+    }
+  }
+
+  async fetchMessage(
+    chatPeer: string,
+    botHandle: string,
+    msgId: number,
+  ): Promise<RawBotMessage | null> {
+    if (!this.paired) return null
+    const normBot = normalizeBotHandle(botHandle)
+    const normPeer = normalizeChatPeer(chatPeer) ?? normBot
+    const rec = this.records.find(
+      (r) => r.botHandle === normBot && (r.chatPeer ?? r.botHandle) === normPeer && r.msgId === msgId,
+    )
+    if (!rec || rec.buttons.length === 0) return null
+    return this.toRaw(rec)
   }
 
   async pressCallback(
+    chatPeer: string,
     botHandle: string,
     msgId: number,
     data: Uint8Array,
   ): Promise<CallbackPressResult> {
-    const norm = normalizeBotHandle(botHandle)
+    const normBot = normalizeBotHandle(botHandle)
+    const normPeer = normalizeChatPeer(chatPeer) ?? normBot
     const payload = new TextDecoder().decode(data)
-    const rec = this.records.find((r) => r.botHandle === norm && r.msgId === msgId)
+    const rec = this.records.find(
+      (r) => r.botHandle === normBot && (r.chatPeer ?? r.botHandle) === normPeer && r.msgId === msgId,
+    )
     if (!rec) {
-      throw new Error('MESSAGE_NOT_FOUND')
+      throw new Error('BUTTON_NOT_FOUND')
     }
 
     if (payload === 'uptime:ack:4101') {

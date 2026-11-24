@@ -32,8 +32,9 @@ if (authToken && authToken.length < 12) {
 const defaultAllowlist =
   process.env.BOTTAP_ALLOWLIST?.split(',').filter(Boolean) ??
   (mode === 'demo' ? ['uptime_ops_bot', 'deploy_gate_bot', 'vault_guard_bot'] : [])
+const defaultGroups = process.env.BOTTAP_GROUPS?.split(',').filter(Boolean) ?? []
 
-const store = new GatewayStore(dataDir, defaultAllowlist)
+const store = new GatewayStore(dataDir, defaultAllowlist, defaultGroups)
 
 const transport =
   mode === 'demo'

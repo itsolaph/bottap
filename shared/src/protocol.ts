@@ -1,10 +1,12 @@
 export type ButtonStyleKind = 'default' | 'primary' | 'success' | 'danger'
+export type DangerSource = 'protocol' | 'policy'
 
 export interface CallbackButton {
   readonly kind: 'callback'
   readonly label: string
   readonly dataB64: string
   readonly danger: boolean
+  readonly dangerSource?: DangerSource
   readonly requiresPassword: boolean
   readonly style: ButtonStyleKind
 }
@@ -13,15 +15,19 @@ export interface QueueItem {
   readonly id: string
   readonly bot: string
   readonly botTitle: string
+  readonly chatPeer: string
+  readonly chatTitle?: string
   readonly msgId: number
   readonly line: string
   readonly sentAt: number
   readonly buttons: readonly CallbackButton[]
   readonly hiddenNonCallbackCount: number
+  readonly hiddenOverflowCount: number
 }
 
 export interface ArmRequest {
   readonly bot: string
+  readonly chatPeer?: string
   readonly msgId: number
   readonly dataB64: string
 }
@@ -34,6 +40,7 @@ export interface ArmResponse {
 
 export interface PressRequest {
   readonly bot: string
+  readonly chatPeer?: string
   readonly msgId: number
   readonly dataB64: string
   readonly confirmedDanger?: boolean
@@ -54,6 +61,7 @@ export type PressOutcome =
   | {
       readonly ok: true
       readonly bot: string
+      readonly chatPeer: string
       readonly msgId: number
       readonly buttonLabel: string
       readonly answer: string
@@ -80,12 +88,20 @@ export interface PairingState {
   readonly error?: string
 }
 
+export interface ScanDiagnostic {
+  readonly target: string
+  readonly error: string
+}
+
 export type AuditOutcome =
   | 'pressed'
   | 'timeout'
   | 'refused_2fa'
   | 'refused_allowlist'
   | 'refused_danger_unconfirmed'
+  | 'allowlist_add'
+  | 'allowlist_remove'
+  | 'arm_issued'
 
 export interface AuditEntry {
   readonly id: string
@@ -102,7 +118,9 @@ export interface GatewayStatus {
   readonly mode: GatewayMode
   readonly pairing: PairingState
   readonly allowlist: readonly string[]
+  readonly groups: readonly string[]
   readonly pendingCount: number
+  readonly scanDiagnostics: readonly ScanDiagnostic[]
   readonly recentAudit: readonly AuditEntry[]
 }
 
@@ -110,7 +128,9 @@ export interface PendingResponse {
   readonly mode: GatewayMode
   readonly paired: boolean
   readonly allowlist: readonly string[]
+  readonly groups: readonly string[]
   readonly items: readonly QueueItem[]
+  readonly scanDiagnostics: readonly ScanDiagnostic[]
   readonly fetchedAt: number
 }
 
@@ -118,7 +138,12 @@ export type G2ViewState =
   | { readonly screen: 'loading' }
   | { readonly screen: 'offline'; readonly message: string }
   | { readonly screen: 'unpaired'; readonly mode: GatewayMode }
-  | { readonly screen: 'empty'; readonly allowlistCount: number; readonly mode: GatewayMode }
+  | {
+      readonly screen: 'empty'
+      readonly allowlistCount: number
+      readonly mode: GatewayMode
+      readonly scanDiagnostics: readonly ScanDiagnostic[]
+    }
   | { readonly screen: 'queue'; readonly items: readonly QueueItem[]; readonly cursor: number }
   | {
       readonly screen: 'buttons'
@@ -144,6 +169,7 @@ export type G2ViewState =
       readonly screen: 'result'
       readonly items: readonly QueueItem[]
       readonly itemIndex: number
+      readonly ok: boolean
       readonly bot: string
       readonly buttonLabel: string
       readonly headline: string

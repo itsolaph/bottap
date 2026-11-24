@@ -1,7 +1,16 @@
 import { TelegramClient, Api, sessions, password as tgPassword } from 'teleproto'
-import { normalizeBotHandle, type PairingState, type RawBotMessage, type RawInlineButton } from '@bottap/shared'
+import {
+  DEFAULT_MAX_ALERT_AGE_MS,
+  isAllowlisted,
+  normalizeBotHandle,
+  normalizeChatPeer,
+  type PairingState,
+  type RawBotMessage,
+  type RawInlineButton,
+  type ScanDiagnostic,
+} from '@bottap/shared'
 import type { GatewayStore } from './store.js'
-import type { BotTransport, CallbackPressResult } from './transport.js'
+import type { BotTransport, CallbackPressResult, ScanResult } from './transport.js'
 
 const { StringSession } = sessions
 
@@ -24,7 +33,29 @@ function toBase64Url(buf: Buffer | Uint8Array): string {
     .replace(/=+$/g, '')
 }
 
-function extractInlineButtons(markup: unknown): RawInlineButton[] {
+function summarizeMtprotoError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err)
+  const flood = /FLOOD_WAIT_(\d+)/i.exec(msg)
+  if (flood) return `Telegram flood wait (${flood[1]}s)`
+  if (/USERNAME_NOT_OCCUPIED|USERNAME_INVALID|Cannot find any entity/i.test(msg)) {
+    return 'Bot/group not found or never /started'
+  }
+  if (/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|USER_DEACTIVATED/i.test(msg)) {
+    return 'Telegram session expired — re-pair'
+  }
+  if (/CHANNEL_PRIVATE|CHAT_ADMIN_REQUIRED/i.test(msg)) {
+    return 'No access to target chat'
+  }
+  return 'Unreachable (check handle or Telegram session)'
+}
+
+/**
+ * Extracts inline keyboard buttons from Telegram MTProto Layer 234 (`KeyboardInlineButton`
+ * with typed `.type = InlineButtonTypeCallback | InlineButtonTypeUrl | ...` and
+ * `.style = KeyboardButtonStyle`) while remaining backward-compatible with legacy Layer <=233
+ * `KeyboardButtonCallback` constructors.
+ */
+export function extractInlineButtons(markup: unknown): RawInlineButton[] {
   if (!markup || typeof markup !== 'object') return []
   const m = markup as { className?: string; rows?: Array<{ buttons?: unknown[] }> }
   if (m.className !== 'ReplyInlineMarkup' || !Array.isArray(m.rows)) return []
@@ -39,17 +70,28 @@ function extractInlineButtons(markup: unknown): RawInlineButton[] {
         text?: string
         data?: Uint8Array | Buffer
         requiresPassword?: boolean
+        type?: {
+          className?: string
+          data?: Uint8Array | Buffer
+          requiresPassword?: boolean
+        }
         style?: {
           bgDanger?: boolean
           bgPrimary?: boolean
           bgSuccess?: boolean
         }
       }
+
+      const isLayer234 = b.className === 'KeyboardInlineButton' && b.type && typeof b.type === 'object'
+      const typeName = isLayer234 ? b.type!.className ?? 'UnknownInlineButtonType' : b.className ?? 'UnknownButton'
+      const rawData = isLayer234 ? b.type!.data : b.data
+      const requiresPassword = isLayer234 ? Boolean(b.type!.requiresPassword) : Boolean(b.requiresPassword)
+
       out.push({
-        typeName: b.className ?? 'UnknownButton',
+        typeName,
         text: typeof b.text === 'string' ? b.text : '',
-        data: b.data instanceof Uint8Array ? new Uint8Array(b.data) : undefined,
-        requiresPassword: Boolean(b.requiresPassword),
+        data: rawData instanceof Uint8Array ? new Uint8Array(rawData) : undefined,
+        requiresPassword,
         style: b.style
           ? {
               bgDanger: Boolean(b.style.bgDanger),
@@ -63,14 +105,21 @@ function extractInlineButtons(markup: unknown): RawInlineButton[] {
   return out
 }
 
+interface CachedEntity {
+  readonly entity: unknown
+  readonly title: string
+  readonly isBot: boolean
+  readonly cachedAt: number
+}
+
 export class MtprotoBotTransport implements BotTransport {
   readonly mode = 'live' as const
   private client: TelegramClient | null = null
   private pairingState: PairingState
   private pendingPhone: { phoneNumber: string; phoneCodeHash: string } | null = null
-  private entityCache = new Map<string, { entity: unknown; title: string; cachedAt: number }>()
-  private scanCache: { key: string; at: number; items: RawBotMessage[] } | null = null
-  private scanInFlight: { key: string; promise: Promise<RawBotMessage[]> } | null = null
+  private entityCache = new Map<string, CachedEntity>()
+  private scanCache: { key: string; at: number; result: ScanResult } | null = null
+  private scanInFlight: { key: string; promise: Promise<ScanResult> } | null = null
   private authFailures = 0
   private authLockedUntil = 0
 
@@ -174,7 +223,7 @@ export class MtprotoBotTransport implements BotTransport {
     if (await client.isUserAuthorized()) {
       return this.refreshAuthorizedProfile(client)
     }
-    return this.pollQrPairing()
+    return this.exportOrAcceptLoginToken(client, true)
   }
 
   async pollQrPairing(): Promise<PairingState> {
@@ -182,6 +231,14 @@ export class MtprotoBotTransport implements BotTransport {
     if (await client.isUserAuthorized()) {
       return this.refreshAuthorizedProfile(client)
     }
+    // Re-export login token to check acceptance, but preserve current QR URL when token is unchanged
+    return this.exportOrAcceptLoginToken(client, false)
+  }
+
+  private async exportOrAcceptLoginToken(
+    client: TelegramClient,
+    forceFresh: boolean,
+  ): Promise<PairingState> {
     try {
       const res = await client.invoke(
         new Api.auth.ExportLoginToken({
@@ -205,12 +262,21 @@ export class MtprotoBotTransport implements BotTransport {
       }
       if (res instanceof Api.auth.LoginToken) {
         const tokenB64Url = toBase64Url(res.token)
+        const qrUrl = `tg://login?token=${tokenB64Url}`
+        const expiresAt = res.expires * 1000
+        // Keep existing qrUrl stable while scanning unless expired or forced
+        const keepCurrent =
+          !forceFresh &&
+          this.pairingState.status === 'qr_pending' &&
+          this.pairingState.qrUrl &&
+          this.pairingState.qrExpiresAt &&
+          Date.now() < this.pairingState.qrExpiresAt - 4000
         this.pairingState = {
           status: 'qr_pending',
           mode: 'live',
           hasApiCreds: true,
-          qrUrl: `tg://login?token=${tokenB64Url}`,
-          qrExpiresAt: res.expires * 1000,
+          qrUrl: keepCurrent ? this.pairingState.qrUrl : qrUrl,
+          qrExpiresAt: keepCurrent ? this.pairingState.qrExpiresAt : expiresAt,
         }
         return this.getPairingState()
       }
@@ -229,7 +295,7 @@ export class MtprotoBotTransport implements BotTransport {
         status: 'unpaired',
         mode: 'live',
         hasApiCreds: true,
-        error: msg,
+        error: summarizeMtprotoError(err),
       }
       return this.getPairingState()
     }
@@ -344,6 +410,8 @@ export class MtprotoBotTransport implements BotTransport {
     }
     this.store.clearSessionString()
     this.entityCache.clear()
+    this.scanCache = null
+    this.scanInFlight = null
     this.pendingPhone = null
     this.pairingState = {
       status: 'unpaired',
@@ -353,66 +421,134 @@ export class MtprotoBotTransport implements BotTransport {
     return this.getPairingState()
   }
 
-  private async resolveBotEntity(client: TelegramClient, handle: string) {
-    const norm = normalizeBotHandle(handle)
-    if (!norm) throw new Error('Invalid bot handle')
+  private async resolveEntity(
+    client: TelegramClient,
+    peerKey: string,
+    requireBot: boolean,
+  ): Promise<CachedEntity> {
+    const norm = normalizeChatPeer(peerKey)
+    if (!norm) throw new Error('Invalid peer identifier')
     const cached = this.entityCache.get(norm)
-    if (cached && Date.now() - cached.cachedAt < 5 * 60_000) {
+    if (cached && Date.now() - cached.cachedAt < 30 * 60_000) {
+      if (requireBot && !cached.isBot) {
+        throw new Error(`@${norm} is not a Telegram bot account`)
+      }
       return cached
     }
-    const entity = await client.getEntity(norm)
-    const e = entity as { firstName?: string; title?: string; username?: string }
-    const title = e.firstName || e.title || `@${norm}`
-    const record = { entity, title, cachedAt: Date.now() }
+    const target: Api.TypeEntityLike = /^-?\d+$/.test(norm) ? Number(norm) : norm
+    const entity = await client.getEntity(target)
+    const e = entity as { firstName?: string; title?: string; username?: string; bot?: boolean }
+    const isBot = Boolean(e.bot)
+    if (requireBot && !isBot) {
+      throw new Error(`@${norm} is not a Telegram bot account`)
+    }
+    const title = e.title || e.firstName || (e.username ? `@${e.username}` : norm)
+    const record: CachedEntity = { entity, title, isBot, cachedAt: Date.now() }
     this.entityCache.set(norm, record)
     return record
   }
 
-  async scanPending(allowlist: readonly string[]): Promise<RawBotMessage[]> {
+  async scanPending(
+    allowlist: readonly string[],
+    groups: readonly string[] = [],
+  ): Promise<ScanResult> {
     if (this.pairingState.status !== 'paired' || !this.client) {
-      return []
+      return { items: [], diagnostics: [] }
     }
-    const key = allowlist.map((h) => normalizeBotHandle(h)).filter(Boolean).sort().join(',')
+    const botsKey = allowlist.map((h) => normalizeBotHandle(h)).filter(Boolean).sort().join(',')
+    const groupsKey = groups.map((g) => normalizeChatPeer(g)).filter(Boolean).sort().join(',')
+    const key = `${botsKey}|${groupsKey}`
     const now = Date.now()
     if (this.scanCache && this.scanCache.key === key && now - this.scanCache.at < 1500) {
-      return this.scanCache.items
+      return this.scanCache.result
     }
     if (this.scanInFlight && this.scanInFlight.key === key) {
       return this.scanInFlight.promise
     }
 
-    const work = (async (): Promise<RawBotMessage[]> => {
+    const work = (async (): Promise<ScanResult> => {
       const client = await this.ensureClient()
       const results: RawBotMessage[] = []
+      const diagnostics: ScanDiagnostic[] = []
+      const cutoffMs = Date.now() - DEFAULT_MAX_ALERT_AGE_MS
 
+      // 1. Direct bot DM threads (verified bot entities only)
       for (const handle of allowlist) {
         const norm = normalizeBotHandle(handle)
         if (!norm) continue
         try {
-          const { entity, title } = await this.resolveBotEntity(client, norm)
-          const messages = await client.getMessages(entity as Api.TypeEntityLike, { limit: 8 })
+          const { entity, title } = await this.resolveEntity(client, norm, true)
+          const messages = await client.getMessages(entity as Api.TypeEntityLike, { limit: 24 })
           for (const msg of messages) {
+            if (msg.out) continue
+            const sentAt = typeof msg.date === 'number' ? msg.date * 1000 : Date.now()
+            if (sentAt < cutoffMs) continue
             const buttons = extractInlineButtons(msg.replyMarkup)
             if (buttons.length === 0) continue
             const rawText = typeof msg.message === 'string' ? msg.message : ''
-            const sentAt = typeof msg.date === 'number' ? msg.date * 1000 : Date.now()
             results.push({
               botHandle: norm,
               botTitle: title,
+              chatPeer: norm,
               msgId: msg.id,
               rawText,
               sentAt,
               buttons,
             })
           }
-        } catch {
-          // Skip unreachable/unstarted bot without failing the whole queue
+        } catch (err) {
+          const msg = err instanceof Error && err.message.includes('not a Telegram bot')
+            ? err.message
+            : summarizeMtprotoError(err)
+          diagnostics.push({ target: `@${norm}`, error: msg })
+        }
+      }
+
+      // 2. Allowlisted ops groups (strictly messages authored by allowlisted bots)
+      for (const groupPeer of groups) {
+        const normGroup = normalizeChatPeer(groupPeer)
+        if (!normGroup) continue
+        try {
+          const { entity: groupEntity, title: groupTitle } = await this.resolveEntity(
+            client,
+            normGroup,
+            false,
+          )
+          const messages = await client.getMessages(groupEntity as Api.TypeEntityLike, { limit: 30 })
+          for (const msg of messages) {
+            const sentAt = typeof msg.date === 'number' ? msg.date * 1000 : Date.now()
+            if (sentAt < cutoffMs) continue
+            const buttons = extractInlineButtons(msg.replyMarkup)
+            if (buttons.length === 0) continue
+            const sender = (await msg.getSender?.()) as {
+              bot?: boolean
+              username?: string
+              firstName?: string
+            } | null
+            if (!sender?.bot || !sender.username) continue
+            const senderBot = normalizeBotHandle(sender.username)
+            if (!senderBot || !isAllowlisted(senderBot, allowlist)) continue
+            const rawText = typeof msg.message === 'string' ? msg.message : ''
+            results.push({
+              botHandle: senderBot,
+              botTitle: sender.firstName || `@${senderBot}`,
+              chatPeer: normGroup,
+              chatTitle: groupTitle,
+              msgId: msg.id,
+              rawText,
+              sentAt,
+              buttons,
+            })
+          }
+        } catch (err) {
+          diagnostics.push({ target: normGroup, error: summarizeMtprotoError(err) })
         }
       }
 
       results.sort((a, b) => b.sentAt - a.sentAt)
-      this.scanCache = { key, at: Date.now(), items: results }
-      return results
+      const result: ScanResult = { items: results, diagnostics }
+      this.scanCache = { key, at: Date.now(), result }
+      return result
     })()
 
     this.scanInFlight = { key, promise: work }
@@ -425,16 +561,65 @@ export class MtprotoBotTransport implements BotTransport {
     }
   }
 
+  async fetchMessage(
+    chatPeer: string,
+    botHandle: string,
+    msgId: number,
+  ): Promise<RawBotMessage | null> {
+    if (this.pairingState.status !== 'paired' || !this.client) {
+      return null
+    }
+    const client = await this.ensureClient()
+    const normBot = normalizeBotHandle(botHandle)
+    const normPeer = normalizeChatPeer(chatPeer) ?? normBot
+    if (!normBot || !normPeer) return null
+
+    const isDm = normPeer === normBot
+    const { entity, title } = await this.resolveEntity(client, normPeer, isDm)
+    const fetched = await client.getMessages(entity as Api.TypeEntityLike, { ids: [msgId] })
+    const msg = fetched[0]
+    if (!msg) return null
+
+    if (!isDm) {
+      const sender = (await msg.getSender?.()) as { bot?: boolean; username?: string } | null
+      const senderHandle = sender?.username ? normalizeBotHandle(sender.username) : null
+      if (!sender?.bot || senderHandle !== normBot) {
+        return null
+      }
+    }
+
+    const buttons = extractInlineButtons(msg.replyMarkup)
+    if (buttons.length === 0) return null
+    const rawText = typeof msg.message === 'string' ? msg.message : ''
+    const sentAt = typeof msg.date === 'number' ? msg.date * 1000 : Date.now()
+    return {
+      botHandle: normBot,
+      botTitle: isDm ? title : `@${normBot}`,
+      chatPeer: normPeer,
+      chatTitle: isDm ? undefined : title,
+      msgId: msg.id,
+      rawText,
+      sentAt,
+      buttons,
+    }
+  }
+
   async pressCallback(
+    chatPeer: string,
     botHandle: string,
     msgId: number,
     data: Uint8Array,
+    originalRawText?: string,
   ): Promise<CallbackPressResult> {
     if (this.pairingState.status !== 'paired' || !this.client) {
       throw new Error('NOT_PAIRED')
     }
     const client = await this.ensureClient()
-    const { entity } = await this.resolveBotEntity(client, botHandle)
+    const normBot = normalizeBotHandle(botHandle)
+    const normPeer = normalizeChatPeer(chatPeer) ?? normBot
+    if (!normBot || !normPeer) throw new Error('INVALID_PEER')
+
+    const { entity } = await this.resolveEntity(client, normPeer, normPeer === normBot)
 
     let answer = ''
     let timedOut = false
@@ -452,27 +637,39 @@ export class MtprotoBotTransport implements BotTransport {
       if (msg.includes('BOT_RESPONSE_TIMEOUT')) {
         timedOut = true
         answer = 'Bot did not answer'
+      } else if (/MESSAGE_ID_INVALID|DATA_INVALID/i.test(msg)) {
+        throw new Error('BUTTON_NOT_FOUND')
+      } else if (/FLOOD_WAIT_(\d+)/i.test(msg)) {
+        const secs = /FLOOD_WAIT_(\d+)/i.exec(msg)?.[1] ?? '30'
+        throw new Error(`RATE_LIMITED:${secs}`)
       } else {
         throw err
       }
     }
 
-    // Brief settle to read the bot's edited alert line (if any) without scanning history
+    // Check up to twice (350ms, then +650ms) for a genuine message edit compared to originalRawText
     let editedRawText: string | null = null
-    try {
-      await new Promise((r) => setTimeout(r, 350))
-      const refreshed = await client.getMessages(entity as Api.TypeEntityLike, { ids: [msgId] })
-      const updated = refreshed[0]
-      if (updated && typeof updated.message === 'string' && updated.message.trim()) {
-        editedRawText = updated.message
+    const origNorm = (originalRawText ?? '').trim()
+    for (const delayMs of [350, 650]) {
+      try {
+        await new Promise((r) => setTimeout(r, delayMs))
+        const refreshed = await client.getMessages(entity as Api.TypeEntityLike, { ids: [msgId] })
+        const updated = refreshed[0]
+        if (updated && typeof updated.message === 'string') {
+          const nextText = updated.message.trim()
+          if (nextText && nextText !== origNorm) {
+            editedRawText = nextText
+            break
+          }
+        }
+      } catch {
+        break
       }
-    } catch {
-      // Optional confirmation read; press itself already succeeded
     }
 
     this.scanCache = null
     return {
-      answer: answer || (timedOut ? 'Bot did not answer' : 'Confirmed'),
+      answer: answer || (timedOut ? 'Bot did not answer' : 'Bot answered'),
       editedRawText,
       timedOut,
     }

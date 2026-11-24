@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:sandbox": "tsc --noEmit && vite build --mode sandbox --outDir dist-sandbox",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "pack": "npm run build && evenhub pack app.json dist -o dist/bottap.ehpk",
