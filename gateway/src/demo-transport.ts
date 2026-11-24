@@ -227,7 +227,7 @@ export class DemoBotTransport implements BotTransport {
       }
     }
     if (payload === 'vault:defer:9055') {
-      // Simulate BOT_RESPONSE_TIMEOUT handling from PLAN.md
+      // Exercise BOT_RESPONSE_TIMEOUT handling for slow bots
       rec.buttons = []
       return {
         answer: 'Bot did not answer',

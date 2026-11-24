@@ -8,6 +8,8 @@ import {
   isAllowlisted,
   normalizeBotHandle,
   sanitizeAlertLine,
+  type ArmRequest,
+  type ArmResponse,
   type AuditOutcome,
   type GatewayStatus,
   type PendingResponse,
@@ -19,6 +21,8 @@ import type { GatewayStore } from './store.js'
 import type { BotTransport } from './transport.js'
 
 const MAX_BODY_BYTES = 16 * 1024
+const ARM_TTL_MS = 8_000
+const RATE_WINDOW_MS = 60_000
 
 export interface GatewayServerOptions {
   readonly transport: BotTransport
@@ -40,15 +44,83 @@ const MIME_BY_EXT: Record<string, string> = {
   '.woff': 'font/woff',
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, corsOrigin: string): void {
+interface ArmRecord {
+  readonly key: string
+  readonly expiresAt: number
+}
+
+class FixedWindowLimiter {
+  private readonly buckets = new Map<string, { count: number; resetAt: number }>()
+
+  allow(bucketKey: string, limit: number, now = Date.now()): boolean {
+    const existing = this.buckets.get(bucketKey)
+    if (!existing || now >= existing.resetAt) {
+      if (this.buckets.size > 512) {
+        for (const [k, v] of this.buckets) {
+          if (now >= v.resetAt) this.buckets.delete(k)
+        }
+      }
+      this.buckets.set(bucketKey, { count: 1, resetAt: now + RATE_WINDOW_MS })
+      return true
+    }
+    if (existing.count >= limit) return false
+    existing.count += 1
+    return true
+  }
+}
+
+function parseAllowedOrigins(raw?: string): Set<string> {
+  const out = new Set<string>()
+  if (!raw) return out
+  for (const part of raw.split(',')) {
+    const trimmed = part.trim().replace(/\/+$/, '')
+    if (trimmed && trimmed !== '*') {
+      out.add(trimmed)
+    }
+  }
+  return out
+}
+
+function isSameOrigin(origin: string, hostHeader?: string): boolean {
+  if (!hostHeader) return false
+  const cleanOrigin = origin.trim().replace(/\/+$/, '')
+  return cleanOrigin === `http://${hostHeader}` || cleanOrigin === `https://${hostHeader}`
+}
+
+function resolveCorsHeader(
+  req: IncomingMessage,
+  allowedOrigins: ReadonlySet<string>,
+): { allowed: boolean; headerValue: string | null } {
+  const origin = req.headers.origin
+  if (!origin) return { allowed: true, headerValue: null }
+  const cleanOrigin = origin.trim().replace(/\/+$/, '')
+  if (isSameOrigin(cleanOrigin, req.headers.host)) {
+    return { allowed: true, headerValue: cleanOrigin }
+  }
+  if (allowedOrigins.has(cleanOrigin)) {
+    return { allowed: true, headerValue: cleanOrigin }
+  }
+  return { allowed: false, headerValue: null }
+}
+
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  corsHeader: string | null,
+): void {
   const payload = JSON.stringify(body)
-  res.writeHead(status, {
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': corsOrigin,
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-  })
+    Vary: 'Origin',
+  }
+  if (corsHeader) {
+    headers['Access-Control-Allow-Origin'] = corsHeader
+    headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+  }
+  res.writeHead(status, headers)
   res.end(payload)
 }
 
@@ -95,7 +167,10 @@ function tryServeStatic(staticDir: string, reqPath: string, res: ServerResponse)
   const cleanRel = reqPath === '/' ? 'index.html' : reqPath.replace(/^\/+/, '')
   const resolvedRoot = path.resolve(staticDir)
   const candidate = path.resolve(resolvedRoot, cleanRel)
-  if (!candidate.startsWith(resolvedRoot + path.sep) && candidate !== path.join(resolvedRoot, 'index.html')) {
+  if (
+    !candidate.startsWith(resolvedRoot + path.sep) &&
+    candidate !== path.join(resolvedRoot, 'index.html')
+  ) {
     return false
   }
   if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
@@ -110,9 +185,45 @@ function tryServeStatic(staticDir: string, reqPath: string, res: ServerResponse)
   return true
 }
 
+function clientIpOf(req: IncomingMessage): string {
+  return req.socket.remoteAddress || 'local'
+}
+
 export function createGatewayServer(options: GatewayServerOptions): http.Server {
-  const corsOrigin = options.corsOrigin || '*'
+  const allowedOrigins = parseAllowedOrigins(options.corsOrigin)
   const { transport, store } = options
+  const limiter = new FixedWindowLimiter()
+  const armedTokens = new Map<string, ArmRecord>()
+
+  const pruneArmed = (now = Date.now()) => {
+    for (const [tok, rec] of armedTokens) {
+      if (now >= rec.expiresAt) armedTokens.delete(tok)
+    }
+  }
+
+  const issueArmToken = (bot: string, msgId: number, dataB64: string): ArmResponse => {
+    const now = Date.now()
+    pruneArmed(now)
+    const armToken = crypto.randomBytes(16).toString('base64url')
+    const expiresAt = now + ARM_TTL_MS
+    armedTokens.set(armToken, { key: `${bot}:${msgId}:${dataB64}`, expiresAt })
+    return { ok: true, armToken, expiresAt }
+  }
+
+  const consumeArmToken = (
+    token: string | undefined,
+    bot: string,
+    msgId: number,
+    dataB64: string,
+  ): boolean => {
+    const now = Date.now()
+    pruneArmed(now)
+    if (!token) return false
+    const rec = armedTokens.get(token)
+    if (!rec) return false
+    armedTokens.delete(token)
+    return now < rec.expiresAt && rec.key === `${bot}:${msgId}:${dataB64}`
+  }
 
   const logAudit = (
     bot: string,
@@ -144,17 +255,24 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
   }
 
   return http.createServer(async (req, res) => {
+    const cors = resolveCorsHeader(req, allowedOrigins)
     try {
       const method = req.method ?? 'GET'
       const parsed = new URL(req.url ?? '/', 'http://127.0.0.1')
       const pathname = parsed.pathname
 
       if (method === 'OPTIONS') {
-        res.writeHead(204, {
-          'Access-Control-Allow-Origin': corsOrigin,
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-          'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-        })
+        if (!cors.allowed) {
+          sendJson(res, 403, { ok: false, message: 'Origin not allowed' }, null)
+          return
+        }
+        const headers: Record<string, string> = { Vary: 'Origin' }
+        if (cors.headerValue) {
+          headers['Access-Control-Allow-Origin'] = cors.headerValue
+          headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+          headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+        }
+        res.writeHead(204, headers)
         res.end()
         return
       }
@@ -168,22 +286,48 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
             mode: transport.mode,
             paired: transport.getPairingState().status === 'paired',
           },
-          corsOrigin,
+          cors.headerValue,
         )
         return
       }
 
       // Static companion UI assets (no auth required for HTML/JS/CSS shell)
-      if (method === 'GET' && options.staticDir && !pathname.startsWith('/pending') && !pathname.startsWith('/status') && !pathname.startsWith('/allowlist') && !pathname.startsWith('/pairing')) {
+      if (
+        method === 'GET' &&
+        options.staticDir &&
+        !pathname.startsWith('/pending') &&
+        !pathname.startsWith('/status') &&
+        !pathname.startsWith('/allowlist') &&
+        !pathname.startsWith('/pairing') &&
+        !pathname.startsWith('/arm')
+      ) {
         if (tryServeStatic(options.staticDir, pathname, res)) {
           return
         }
       }
 
-      if (!verifyBearer(req, options.authToken)) {
-        sendJson(res, 401, { ok: false, code: 'UNAUTHORIZED', message: 'Valid Bearer token required' }, corsOrigin)
+      // Block cross-origin state-changing requests from untrusted origins
+      if ((method === 'POST' || method === 'DELETE') && !cors.allowed) {
+        sendJson(
+          res,
+          403,
+          { ok: false, code: 'ORIGIN_NOT_ALLOWED', message: 'Cross-origin request blocked' },
+          null,
+        )
         return
       }
+
+      if (!verifyBearer(req, options.authToken)) {
+        sendJson(
+          res,
+          401,
+          { ok: false, code: 'UNAUTHORIZED', message: 'Valid Bearer token required' },
+          cors.headerValue,
+        )
+        return
+      }
+
+      const ip = clientIpOf(req)
 
       if (method === 'GET' && pathname === '/status') {
         const pairing = transport.getPairingState()
@@ -196,7 +340,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           pendingCount: items.length,
           recentAudit: store.getRecentAudit(),
         }
-        sendJson(res, 200, payload, corsOrigin)
+        sendJson(res, 200, payload, cors.headerValue)
         return
       }
 
@@ -210,11 +354,89 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           items,
           fetchedAt: Date.now(),
         }
-        sendJson(res, 200, payload, corsOrigin)
+        sendJson(res, 200, payload, cors.headerValue)
+        return
+      }
+
+      // Server-issued single-use arm token for bg_danger double-press confirmation
+      if (method === 'POST' && pathname === '/arm') {
+        if (!limiter.allow(`press:${ip}`, 40)) {
+          sendJson(
+            res,
+            429,
+            { ok: false, code: 'RATE_LIMITED', message: 'Too many requests, retry shortly' },
+            cors.headerValue,
+          )
+          return
+        }
+        const body = await readJsonBody<Partial<ArmRequest>>(req)
+        const bot = normalizeBotHandle(typeof body.bot === 'string' ? body.bot : '')
+        const msgId = typeof body.msgId === 'number' ? body.msgId : -1
+        const dataB64 = typeof body.dataB64 === 'string' ? body.dataB64 : ''
+        const dataBytes = decodeBase64ToBytes(dataB64)
+        if (!bot || !Number.isInteger(msgId) || msgId <= 0 || !dataBytes) {
+          sendJson(
+            res,
+            400,
+            { ok: false, code: 'INVALID_REQUEST', message: 'Valid bot, msgId, and dataB64 required' },
+            cors.headerValue,
+          )
+          return
+        }
+        if (transport.getPairingState().status !== 'paired') {
+          sendJson(
+            res,
+            409,
+            { ok: false, code: 'NOT_PAIRED', message: 'Pair your account in the companion app first' },
+            cors.headerValue,
+          )
+          return
+        }
+        if (!isAllowlisted(bot, store.getAllowlist())) {
+          sendJson(
+            res,
+            403,
+            { ok: false, code: 'BOT_NOT_ALLOWLISTED', message: `@${bot} is not on the allowlist` },
+            cors.headerValue,
+          )
+          return
+        }
+        const liveItems = await getFilteredQueue()
+        const item = liveItems.find((i) => i.bot === bot && i.msgId === msgId)
+        const button = item?.buttons.find((b) => b.dataB64 === dataB64)
+        if (!item || !button) {
+          sendJson(
+            res,
+            404,
+            { ok: false, code: 'BUTTON_NOT_FOUND', message: 'Callback button no longer present' },
+            cors.headerValue,
+          )
+          return
+        }
+        if (button.requiresPassword) {
+          sendJson(
+            res,
+            403,
+            { ok: false, code: 'PASSWORD_REQUIRED', message: '2FA button - open Telegram' },
+            cors.headerValue,
+          )
+          return
+        }
+        sendJson(res, 200, issueArmToken(bot, msgId, dataB64), cors.headerValue)
         return
       }
 
       if (method === 'POST' && pathname === '/press') {
+        if (!limiter.allow(`press:${ip}`, 40)) {
+          const err: PressOutcome = {
+            ok: false,
+            code: 'RATE_LIMITED',
+            message: 'Too many requests, retry shortly',
+          }
+          sendJson(res, 429, err, cors.headerValue)
+          return
+        }
+
         const body = await readJsonBody<Partial<PressRequest>>(req)
         const bot = normalizeBotHandle(typeof body.bot === 'string' ? body.bot : '')
         const msgId = typeof body.msgId === 'number' ? body.msgId : -1
@@ -227,7 +449,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
             code: 'INVALID_REQUEST',
             message: 'bot, positive integer msgId, and valid callback dataB64 are required',
           }
-          sendJson(res, 400, err, corsOrigin)
+          sendJson(res, 400, err, cors.headerValue)
           return
         }
 
@@ -237,7 +459,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
             code: 'NOT_PAIRED',
             message: 'Pair your account in the companion app first',
           }
-          sendJson(res, 409, err, corsOrigin)
+          sendJson(res, 409, err, cors.headerValue)
           return
         }
 
@@ -250,7 +472,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
             code: 'BOT_NOT_ALLOWLISTED',
             message: `@${bot} is not on the allowlist`,
           }
-          sendJson(res, 403, err, corsOrigin)
+          sendJson(res, 403, err, cors.headerValue)
           return
         }
 
@@ -264,7 +486,7 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
             code: 'BUTTON_NOT_FOUND',
             message: 'Callback button no longer present on that message',
           }
-          sendJson(res, 404, err, corsOrigin)
+          sendJson(res, 404, err, cors.headerValue)
           return
         }
 
@@ -276,26 +498,36 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
             code: 'PASSWORD_REQUIRED',
             message: '2FA button - open Telegram',
           }
-          sendJson(res, 403, err, corsOrigin)
+          sendJson(res, 403, err, cors.headerValue)
           return
         }
 
-        // Gate 4: Protocol-level double-press enforcement for bg_danger
-        if (button.danger && body.confirmedDanger !== true) {
-          logAudit(
-            bot,
-            msgId,
-            button.label,
-            'refused_danger_unconfirmed',
-            'Destructive button requires confirmedDanger=true',
-          )
-          const err: PressOutcome = {
-            ok: false,
-            code: 'DANGER_CONFIRMATION_REQUIRED',
-            message: 'Double-press required for destructive button',
+        // Gate 4: Protocol-level server-enforced two-step confirmation for bg_danger
+        if (button.danger) {
+          const hasValidArm =
+            body.confirmedDanger === true &&
+            consumeArmToken(
+              typeof body.armToken === 'string' ? body.armToken : undefined,
+              bot,
+              msgId,
+              dataB64,
+            )
+          if (!hasValidArm) {
+            logAudit(
+              bot,
+              msgId,
+              button.label,
+              'refused_danger_unconfirmed',
+              'Destructive button requires server-issued two-step arm token',
+            )
+            const err: PressOutcome = {
+              ok: false,
+              code: 'DANGER_CONFIRMATION_REQUIRED',
+              message: 'Double-press arm token required for destructive button',
+            }
+            sendJson(res, 409, err, cors.headerValue)
+            return
           }
-          sendJson(res, 409, err, corsOrigin)
-          return
         }
 
         try {
@@ -320,22 +552,23 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
             timedOut: pressed.timedOut,
             pressedAt: Date.now(),
           }
-          sendJson(res, 200, okRes, corsOrigin)
+          sendJson(res, 200, okRes, cors.headerValue)
           return
         } catch (err) {
+          console.error('[bottap-gateway] pressCallback failed:', err instanceof Error ? err.message : err)
           const fail: PressOutcome = {
             ok: false,
             code: 'TRANSPORT_ERROR',
-            message: err instanceof Error ? err.message : 'Callback failed',
+            message: 'Gateway transport error',
           }
-          sendJson(res, 502, fail, corsOrigin)
+          sendJson(res, 502, fail, cors.headerValue)
           return
         }
       }
 
       // Allowlist management
       if (method === 'GET' && pathname === '/allowlist') {
-        sendJson(res, 200, { ok: true, allowlist: store.getAllowlist() }, corsOrigin)
+        sendJson(res, 200, { ok: true, allowlist: store.getAllowlist() }, cors.headerValue)
         return
       }
 
@@ -343,68 +576,116 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
         const body = await readJsonBody<{ bot?: string }>(req)
         const norm = normalizeBotHandle(body.bot ?? '')
         if (!norm) {
-          sendJson(res, 400, { ok: false, message: 'Valid bot username required (3-64 chars, a-z/0-9/_)' }, corsOrigin)
+          sendJson(
+            res,
+            400,
+            { ok: false, message: 'Valid bot username required (3-64 chars, a-z/0-9/_)' },
+            cors.headerValue,
+          )
           return
         }
         const allowlist = store.addAllowlist(norm)
-        sendJson(res, 200, { ok: true, allowlist }, corsOrigin)
+        sendJson(res, 200, { ok: true, allowlist }, cors.headerValue)
         return
       }
 
       if (method === 'DELETE' && pathname.startsWith('/allowlist/')) {
         const target = decodeURIComponent(pathname.slice('/allowlist/'.length))
         const allowlist = store.removeAllowlist(target)
-        sendJson(res, 200, { ok: true, allowlist }, corsOrigin)
+        sendJson(res, 200, { ok: true, allowlist }, cors.headerValue)
         return
       }
 
-      // Self-hosted pairing endpoints (session stays strictly on user's gateway)
+      // Self-hosted pairing endpoints (rate-limited; session stays strictly on user's gateway)
+      if (pathname.startsWith('/pairing/')) {
+        if (!limiter.allow(`pairing:${ip}`, 15)) {
+          sendJson(
+            res,
+            429,
+            { ok: false, code: 'RATE_LIMITED', message: 'Pairing rate limit reached, retry shortly' },
+            cors.headerValue,
+          )
+          return
+        }
+      }
+
       if (method === 'POST' && pathname === '/pairing/qr') {
         const pairing = await transport.startQrPairing()
-        sendJson(res, 200, { ok: true, pairing }, corsOrigin)
+        sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
         return
       }
       if (method === 'GET' && pathname === '/pairing/qr') {
         const pairing = await transport.pollQrPairing()
-        sendJson(res, 200, { ok: true, pairing }, corsOrigin)
+        sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
         return
       }
       if (method === 'POST' && pathname === '/pairing/phone') {
         const body = await readJsonBody<{ phoneNumber?: string }>(req)
         const pairing = await transport.startPhonePairing(body.phoneNumber ?? '')
-        sendJson(res, 200, { ok: true, pairing }, corsOrigin)
+        sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
         return
       }
       if (method === 'POST' && pathname === '/pairing/code') {
         const body = await readJsonBody<{ code?: string }>(req)
         const pairing = await transport.submitPhoneCode(body.code ?? '')
-        sendJson(res, 200, { ok: true, pairing }, corsOrigin)
+        sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
         return
       }
       if (method === 'POST' && pathname === '/pairing/2fa') {
         const body = await readJsonBody<{ password?: string }>(req)
         const pairing = await transport.submit2FAPassword(body.password ?? '')
-        sendJson(res, 200, { ok: true, pairing }, corsOrigin)
+        sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
         return
       }
       if (method === 'POST' && pathname === '/pairing/disconnect') {
         const pairing = await transport.disconnect()
-        sendJson(res, 200, { ok: true, pairing }, corsOrigin)
+        sendJson(res, 200, { ok: true, pairing }, cors.headerValue)
         return
       }
 
-      if (method === 'POST' && pathname === '/demo/reset' && transport.mode === 'demo' && transport.resetDemo) {
+      if (
+        method === 'POST' &&
+        pathname === '/demo/reset' &&
+        transport.mode === 'demo' &&
+        transport.resetDemo
+      ) {
         transport.resetDemo()
-        sendJson(res, 200, { ok: true, mode: 'demo' }, corsOrigin)
+        armedTokens.clear()
+        sendJson(res, 200, { ok: true, mode: 'demo' }, cors.headerValue)
         return
       }
 
       // Explicitly no chat-reading, dialog-listing, or send-message endpoints exist
-      sendJson(res, 404, { ok: false, message: 'Not found' }, corsOrigin)
+      sendJson(res, 404, { ok: false, message: 'Not found' }, cors.headerValue)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Internal error'
-      const status = msg === 'INVALID_JSON' ? 400 : msg === 'BODY_TOO_LARGE' ? 413 : 500
-      sendJson(res, status, { ok: false, message: msg }, corsOrigin)
+      const isClientErr =
+        msg === 'INVALID_JSON' ||
+        msg === 'BODY_TOO_LARGE' ||
+        msg === 'Phone number is required' ||
+        msg === 'Start phone pairing first' ||
+        msg === '2FA verification is not active' ||
+        msg === 'Invalid login code' ||
+        msg === 'Invalid 2FA password' ||
+        msg.startsWith('Too many failed') ||
+        msg.startsWith('Set TG_API_ID')
+      const status =
+        msg === 'BODY_TOO_LARGE'
+          ? 413
+          : msg.startsWith('Too many failed')
+            ? 429
+            : isClientErr
+              ? 400
+              : 500
+      if (!isClientErr) {
+        console.error('[bottap-gateway] internal error:', msg)
+      }
+      sendJson(
+        res,
+        status,
+        { ok: false, message: isClientErr ? msg : 'Gateway request failed' },
+        cors.headerValue,
+      )
     }
   })
 }

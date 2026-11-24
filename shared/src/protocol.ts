@@ -20,11 +20,24 @@ export interface QueueItem {
   readonly hiddenNonCallbackCount: number
 }
 
+export interface ArmRequest {
+  readonly bot: string
+  readonly msgId: number
+  readonly dataB64: string
+}
+
+export interface ArmResponse {
+  readonly ok: true
+  readonly armToken: string
+  readonly expiresAt: number
+}
+
 export interface PressRequest {
   readonly bot: string
   readonly msgId: number
   readonly dataB64: string
   readonly confirmedDanger?: boolean
+  readonly armToken?: string
 }
 
 export type PressErrorCode =
@@ -34,6 +47,7 @@ export type PressErrorCode =
   | 'BUTTON_NOT_FOUND'
   | 'NOT_PAIRED'
   | 'INVALID_REQUEST'
+  | 'RATE_LIMITED'
   | 'TRANSPORT_ERROR'
 
 export type PressOutcome =

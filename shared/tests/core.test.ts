@@ -154,10 +154,10 @@ test('G2 reducer enforces danger double-press, 6s arm timeout, 2FA refusal, and 
   state = reduceG2State(state, { type: 'TAP', now: 10_000 }).state
   assert.equal(state.screen, 'buttons')
 
-  // First tap on bg_danger arms confirmation without sending PRESS effect
+  // First tap on bg_danger arms confirmation and requests a server arm token (never PRESS)
   const armed = reduceG2State(state, { type: 'TAP', now: 11_000 })
   assert.equal(armed.state.screen, 'danger_confirm')
-  assert.equal(armed.effect, undefined)
+  assert.equal(armed.effect?.type, 'ARM_DANGER')
 
   // Expiry disarms cleanly
   const expired = reduceG2State(armed.state, {

@@ -1,4 +1,5 @@
 import type {
+  ArmRequest,
   G2ViewState,
   GatewayMode,
   PressOutcome,
@@ -27,6 +28,7 @@ export type G2Action =
   | { readonly type: 'TICK'; readonly now: number }
 
 export type G2Effect =
+  | { readonly type: 'ARM_DANGER'; readonly req: ArmRequest }
   | { readonly type: 'PRESS'; readonly req: PressRequest }
   | { readonly type: 'REFRESH' }
   | { readonly type: 'SHUTDOWN_G2' }
@@ -295,7 +297,7 @@ export function reduceG2State(
           }
         }
 
-        // Protocol-level safety: bg_danger requires explicit second tap
+        // Protocol-level safety: bg_danger requires explicit second tap + server arm token
         if (button.danger) {
           return {
             state: {
@@ -304,6 +306,14 @@ export function reduceG2State(
               itemIndex: state.itemIndex,
               buttonIndex: state.buttonIndex,
               armedAt: action.now,
+            },
+            effect: {
+              type: 'ARM_DANGER',
+              req: {
+                bot: item.bot,
+                msgId: item.msgId,
+                dataB64: button.dataB64,
+              },
             },
           }
         }

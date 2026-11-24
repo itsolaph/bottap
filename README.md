@@ -18,9 +18,10 @@ Safety rules are enforced on **both** the G2 lens and the self-hosted gateway �
 |---|---|
 | Non-allowlisted chat / bot | Invisible on `GET /pending`; rejected with HTTP `403` on `POST /press` |
 | `KeyboardButtonUrl`, `KeyboardButtonWebView`, `KeyboardButtonGame`, `KeyboardButtonBuy`, `KeyboardButtonSwitchInline`, `KeyboardButtonCopy` | Stripped at the gateway parser boundary — never rendered on glasses |
-| `KeyboardButtonCallback` with `style.bgDanger` (Telegram MTProto Layer 234 `KeyboardButtonStyle`) | First tap arms `PRESS AGAIN TO CONFIRM` (6s auto-disarm); gateway rejects without `confirmedDanger: true` (`HTTP 409`) |
+| `KeyboardButtonCallback` with `style.bgDanger` (Telegram MTProto Layer 234 `KeyboardButtonStyle`) | First tap arms `PRESS AGAIN TO CONFIRM` (6s auto-disarm) and requests a single-use server `POST /arm` token (8s TTL); gateway rejects any `POST /press` without a matching token (`HTTP 409`) |
 | `KeyboardButtonCallback` with `requiresPassword: true` (2FA-gated) | Refused immediately on G2 (`2FA button - open Telegram`) and rejected with HTTP `403` on gateway |
-| Chat reading / message sending | **No endpoints exist.** The gateway exposes only pending callback buttons, callback press, allowlist, and local pairing |
+| Chat reading / message sending | **No endpoints exist.** The gateway exposes only pending callback buttons, danger arming, callback press, allowlist, and rate-limited local pairing |
+| Network & transport boundary | Binds `127.0.0.1` by default, fails closed in live mode without `BOTTAP_TOKEN` on non-loopback hosts, blocks cross-origin `POST`/`DELETE` from unlisted origins, and refuses non-loopback plaintext HTTP in the companion client |
 | `BOT_RESPONSE_TIMEOUT` | Handled gracefully (`Bot did not answer`), logged in the audit trail |
 
 ---
@@ -78,14 +79,14 @@ Controls in the companion view / keyboard mirror the R1 ring:
 ### 2. Self-Hosted Live MTProto Gateway (One Command via Docker)
 
 1. Create your own Telegram API credentials (`api_id` and `api_hash`) at [my.telegram.org](https://my.telegram.org) using an aged Telegram account.
-2. Copy `.env.example` to `.env` and fill in `TG_API_ID`, `TG_API_HASH`, `BOTTAP_ALLOWLIST`, and optionally `BOTTAP_TOKEN`:
+2. Copy `.env.example` to `.env` and fill in `TG_API_ID`, `TG_API_HASH`, `BOTTAP_ALLOWLIST`, and a strong `BOTTAP_TOKEN` (minimum 12 characters; required for live mode inside Docker or on non-loopback hosts):
 
 ```bash
 cp .env.example .env
 docker compose up -d --build
 ```
 
-3. Open `http://<your-host>:8788` in your phone or desktop browser, pair via **QR** or **phone + code** (your MTProto session file stays inside the Docker volume `/data/session.txt` with `0600` permissions), and point the Even Hub app at your gateway URL.
+3. `docker-compose.yml` binds strictly to `127.0.0.1:8788` by default. Open `http://127.0.0.1:8788` locally — or front it with an HTTPS reverse proxy (Caddy, Tailscale Serve, or Cloudflare Tunnel) before accessing it from your phone or Even G2 WebView. Pair via **QR** or **phone + code** (your MTProto session stays inside `/data/session.txt` with `0600` permissions).
 
 ### 3. Live Telegram Demo Bot (Real Account Testing)
 
@@ -118,7 +119,8 @@ Only these operational routes exist:
 - `GET /health` — liveness, active mode (`live` or `demo`), and pairing flag
 - `GET /status` — pairing state, allowlist, pending count, and recent press audit log
 - `GET /pending` — allowlisted bots' pending callback-only button items
-- `POST /press` — `{ bot, msgId, dataB64, confirmedDanger? }` → executes `messages.getBotCallbackAnswer` after allowlist, 2FA, and `bg_danger` gates
+- `POST /arm` — `{ bot, msgId, dataB64 }` → issues a single-use 8s TTL `armToken` bound to a destructive button before confirmation
+- `POST /press` — `{ bot, msgId, dataB64, confirmedDanger?, armToken? }` → executes `messages.getBotCallbackAnswer` after allowlist, 2FA, and server-bound `bg_danger` gates
 - `GET /allowlist`, `POST /allowlist`, `DELETE /allowlist/:bot` — manage allowlisted bot handles
 - `POST /pairing/qr`, `GET /pairing/qr`, `POST /pairing/phone`, `POST /pairing/code`, `POST /pairing/2fa`, `POST /pairing/disconnect` — local MTProto pairing lifecycle
 

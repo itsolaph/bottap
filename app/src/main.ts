@@ -25,7 +25,7 @@ import {
   type GatewayStatus,
   type QueueItem,
 } from '@bottap/shared'
-import { GatewayClient } from './client'
+import { GatewayClient, isSecureOrLoopbackUrl } from './client'
 import { renderG2Frame, type G2Frame } from './g2-renderer'
 import { createQrSvgElement } from './qr-svg'
 
@@ -63,6 +63,7 @@ let lastPairingKey = ''
 let lastAnnounced = ''
 let bridgeWriteQueue: Promise<unknown> = Promise.resolve()
 let qrPollTimer: number | null = null
+let pendingArm: { key: string; promise: Promise<string | null> } | null = null
 
 function stopQrPoll(): void {
   if (qrPollTimer !== null) {
@@ -564,7 +565,7 @@ function renderPairingModalState(): void {
     const inp = document.createElement('input')
     inp.className = 'field'
     inp.type = 'tel'
-    inp.placeholder = '+628…'
+    inp.placeholder = '+15550100'
     inp.ariaLabel = 'Phone number'
     const btn = document.createElement('button')
     btn.type = 'submit'
@@ -656,6 +657,9 @@ function syncUI(): void {
 function dispatch(action: G2Action): void {
   const { state, effect } = reduceG2State(g2State, action, lastMeta)
   g2State = state
+  if (state.screen !== 'danger_confirm' && state.screen !== 'pressing') {
+    pendingArm = null
+  }
   syncUI()
 
   if (!effect) return
@@ -667,10 +671,30 @@ function dispatch(action: G2Action): void {
     void refreshFromGateway()
     return
   }
+  if (effect.type === 'ARM_DANGER') {
+    const key = `${effect.req.bot}:${effect.req.msgId}:${effect.req.dataB64}`
+    const promise = client
+      .armDanger(effect.req)
+      .then((res) => res.armToken)
+      .catch(() => null)
+    pendingArm = { key, promise }
+    return
+  }
   if (effect.type === 'PRESS') {
+    const armForPress = pendingArm
+    pendingArm = null
     void (async () => {
       try {
-        const outcome = await client.press(effect.req)
+        let req = effect.req
+        if (req.confirmedDanger) {
+          const key = `${req.bot}:${req.msgId}:${req.dataB64}`
+          const armToken =
+            armForPress && armForPress.key === key ? await armForPress.promise : null
+          if (armToken) {
+            req = { ...req, armToken }
+          }
+        }
+        const outcome = await client.press(req)
         dispatch({ type: 'PRESS_DONE', outcome, now: Date.now() })
       } catch (err) {
         dispatch({
@@ -846,6 +870,13 @@ function setupGatewayDialog(): void {
     const url = urlInput?.value.trim()
     const tok = tokenInput?.value.trim() ?? ''
     if (!url) return
+    if (!isSecureOrLoopbackUrl(url)) {
+      if (pingOut) {
+        pingOut.dataset.ok = 'false'
+        pingOut.textContent = 'Use https:// for non-loopback gateways'
+      }
+      return
+    }
     window.localStorage.setItem(STORAGE_URL_KEY, url)
     window.localStorage.setItem(STORAGE_TOKEN_KEY, tok)
     client.configure({ baseUrl: url, token: tok })

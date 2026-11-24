@@ -80,7 +80,7 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
     assert.equal(twoFa.status, 403)
     assert.equal(((await twoFa.json()) as { code: string }).code, 'PASSWORD_REQUIRED')
 
-    // 3. bg_danger without confirmedDanger returns 409
+    // 3. bg_danger without server armToken returns 409 even when confirmedDanger=true
     const unconfirmedDanger = await fetch(`${baseUrl}/press`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -88,7 +88,7 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
         bot: 'deploy_gate_bot',
         msgId: 8209,
         dataB64: Buffer.from('deploy:approve:8209').toString('base64'),
-        confirmedDanger: false,
+        confirmedDanger: true,
       }),
     })
     assert.equal(unconfirmedDanger.status, 409)
@@ -97,7 +97,20 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
       'DANGER_CONFIRMATION_REQUIRED',
     )
 
-    // 4. bg_danger WITH confirmedDanger=true succeeds and returns edited line
+    // 4. Two-step server-issued armToken + confirmedDanger=true succeeds and consumes token
+    const armRes = await fetch(`${baseUrl}/arm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bot: 'deploy_gate_bot',
+        msgId: 8209,
+        dataB64: Buffer.from('deploy:approve:8209').toString('base64'),
+      }),
+    })
+    assert.equal(armRes.status, 200)
+    const { armToken } = (await armRes.json()) as { ok: boolean; armToken: string }
+    assert.ok(armToken && armToken.length >= 16)
+
     const confirmedDanger = await fetch(`${baseUrl}/press`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -106,6 +119,7 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
         msgId: 8209,
         dataB64: Buffer.from('deploy:approve:8209').toString('base64'),
         confirmedDanger: true,
+        armToken,
       }),
     })
     assert.equal(confirmedDanger.status, 200)
@@ -129,10 +143,22 @@ test('POST /press enforces bg_danger 409 double-press, 2FA 403 refusal, and allo
   })
 })
 
-test('Gateway exposes zero read-chat or send-message endpoints and enforces Bearer token', async () => {
+test('Gateway exposes zero read-chat or send-message endpoints, blocks untrusted origins, and enforces Bearer token', async () => {
   await withServer(async (baseUrl) => {
     const unauth = await fetch(`${baseUrl}/pending`)
     assert.equal(unauth.status, 401)
+    assert.equal(unauth.headers.get('access-control-allow-origin'), null, 'must not emit wildcard CORS by default')
+
+    const crossOriginPost = await fetch(`${baseUrl}/press`, {
+      method: 'POST',
+      headers: {
+        Origin: 'https://untrusted.example',
+        Authorization: 'Bearer secret-test-tok',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ bot: 'uptime_ops_bot', msgId: 4101, dataB64: 'dGVzdA==' }),
+    })
+    assert.equal(crossOriginPost.status, 403)
 
     for (const forbiddenRoute of ['/chats', '/messages', '/dialogs', '/send']) {
       const r = await fetch(`${baseUrl}${forbiddenRoute}`, {

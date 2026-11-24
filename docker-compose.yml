@@ -6,7 +6,7 @@ services:
     container_name: bottap-gateway
     restart: unless-stopped
     ports:
-      - "${BOTTAP_PORT:-8788}:8788"
+      - "${BOTTAP_BIND_HOST:-127.0.0.1}:${BOTTAP_PORT:-8788}:8788"
     env_file:
       - .env
     environment:

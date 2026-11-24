@@ -1,10 +1,24 @@
 import type {
+  ArmRequest,
+  ArmResponse,
   GatewayStatus,
   PairingState,
   PendingResponse,
   PressOutcome,
   PressRequest,
 } from '@bottap/shared'
+
+export function isSecureOrLoopbackUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl, typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1')
+    if (parsed.protocol === 'https:') return true
+    if (parsed.protocol !== 'http:') return false
+    const host = parsed.hostname.toLowerCase()
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]'
+  } catch {
+    return false
+  }
+}
 
 export interface GatewayClientConfig {
   baseUrl: string
@@ -57,6 +71,10 @@ export class GatewayClient {
     return this.request<PendingResponse>('GET', '/pending')
   }
 
+  armDanger(req: ArmRequest): Promise<ArmResponse> {
+    return this.request<ArmResponse>('POST', '/arm', req)
+  }
+
   press(req: PressRequest): Promise<PressOutcome> {
     return this.request<PressOutcome>('POST', '/press', req)
   }
@@ -77,15 +95,24 @@ export class GatewayClient {
     return this.request('GET', '/pairing/qr')
   }
 
+  private assertTransportSafeForSecret(): void {
+    if (!isSecureOrLoopbackUrl(this.baseUrl)) {
+      throw new Error('Use HTTPS (or localhost) before submitting Telegram login codes or 2FA passwords')
+    }
+  }
+
   startPhonePairing(phoneNumber: string): Promise<{ ok: boolean; pairing: PairingState }> {
+    this.assertTransportSafeForSecret()
     return this.request('POST', '/pairing/phone', { phoneNumber })
   }
 
   submitPhoneCode(code: string): Promise<{ ok: boolean; pairing: PairingState }> {
+    this.assertTransportSafeForSecret()
     return this.request('POST', '/pairing/code', { code })
   }
 
   submit2FA(password: string): Promise<{ ok: boolean; pairing: PairingState }> {
+    this.assertTransportSafeForSecret()
     return this.request('POST', '/pairing/2fa', { password })
   }
 

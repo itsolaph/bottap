@@ -69,6 +69,10 @@ export class MtprotoBotTransport implements BotTransport {
   private pairingState: PairingState
   private pendingPhone: { phoneNumber: string; phoneCodeHash: string } | null = null
   private entityCache = new Map<string, { entity: unknown; title: string; cachedAt: number }>()
+  private scanCache: { key: string; at: number; items: RawBotMessage[] } | null = null
+  private scanInFlight: { key: string; promise: Promise<RawBotMessage[]> } | null = null
+  private authFailures = 0
+  private authLockedUntil = 0
 
   constructor(
     private readonly config: MtprotoConfig,
@@ -257,8 +261,28 @@ export class MtprotoBotTransport implements BotTransport {
     return this.getPairingState()
   }
 
+  private assertNotLocked(): void {
+    if (Date.now() < this.authLockedUntil) {
+      throw new Error('Too many failed verification attempts; wait 60 seconds before retrying')
+    }
+  }
+
+  private recordAuthFailure(): void {
+    this.authFailures += 1
+    if (this.authFailures >= 5) {
+      this.authLockedUntil = Date.now() + 60_000
+      this.authFailures = 0
+    }
+  }
+
+  private resetAuthFailures(): void {
+    this.authFailures = 0
+    this.authLockedUntil = 0
+  }
+
   async submitPhoneCode(code: string): Promise<PairingState> {
-    if (!this.pendingPhone) {
+    this.assertNotLocked()
+    if (this.pairingState.status !== 'awaiting_code' || !this.pendingPhone) {
       throw new Error('Start phone pairing first')
     }
     const client = await this.ensureClient()
@@ -270,10 +294,12 @@ export class MtprotoBotTransport implements BotTransport {
           phoneCode: code.trim(),
         }),
       )
+      this.resetAuthFailures()
       return this.refreshAuthorizedProfile(client)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.includes('SESSION_PASSWORD_NEEDED')) {
+        this.resetAuthFailures()
         this.pairingState = {
           status: 'awaiting_2fa',
           mode: 'live',
@@ -282,16 +308,27 @@ export class MtprotoBotTransport implements BotTransport {
         }
         return this.getPairingState()
       }
-      throw err
+      this.recordAuthFailure()
+      throw new Error('Invalid login code')
     }
   }
 
   async submit2FAPassword(password: string): Promise<PairingState> {
+    this.assertNotLocked()
+    if (this.pairingState.status !== 'awaiting_2fa') {
+      throw new Error('2FA verification is not active')
+    }
     const client = await this.ensureClient()
-    const srpParams = await client.invoke(new Api.account.GetPassword())
-    const check = await tgPassword.computeCheck(srpParams, password)
-    await client.invoke(new Api.auth.CheckPassword({ password: check }))
-    return this.refreshAuthorizedProfile(client)
+    try {
+      const srpParams = await client.invoke(new Api.account.GetPassword())
+      const check = await tgPassword.computeCheck(srpParams, password)
+      await client.invoke(new Api.auth.CheckPassword({ password: check }))
+      this.resetAuthFailures()
+      return this.refreshAuthorizedProfile(client)
+    } catch {
+      this.recordAuthFailure()
+      throw new Error('Invalid 2FA password')
+    }
   }
 
   async disconnect(): Promise<PairingState> {
@@ -335,36 +372,57 @@ export class MtprotoBotTransport implements BotTransport {
     if (this.pairingState.status !== 'paired' || !this.client) {
       return []
     }
-    const client = await this.ensureClient()
-    const results: RawBotMessage[] = []
-
-    for (const handle of allowlist) {
-      const norm = normalizeBotHandle(handle)
-      if (!norm) continue
-      try {
-        const { entity, title } = await this.resolveBotEntity(client, norm)
-        const messages = await client.getMessages(entity as Api.TypeEntityLike, { limit: 8 })
-        for (const msg of messages) {
-          const buttons = extractInlineButtons(msg.replyMarkup)
-          if (buttons.length === 0) continue
-          const rawText = typeof msg.message === 'string' ? msg.message : ''
-          const sentAt = typeof msg.date === 'number' ? msg.date * 1000 : Date.now()
-          results.push({
-            botHandle: norm,
-            botTitle: title,
-            msgId: msg.id,
-            rawText,
-            sentAt,
-            buttons,
-          })
-        }
-      } catch {
-        // Skip unreachable/unstarted bot without failing the whole queue
-      }
+    const key = allowlist.map((h) => normalizeBotHandle(h)).filter(Boolean).sort().join(',')
+    const now = Date.now()
+    if (this.scanCache && this.scanCache.key === key && now - this.scanCache.at < 1500) {
+      return this.scanCache.items
+    }
+    if (this.scanInFlight && this.scanInFlight.key === key) {
+      return this.scanInFlight.promise
     }
 
-    results.sort((a, b) => b.sentAt - a.sentAt)
-    return results
+    const work = (async (): Promise<RawBotMessage[]> => {
+      const client = await this.ensureClient()
+      const results: RawBotMessage[] = []
+
+      for (const handle of allowlist) {
+        const norm = normalizeBotHandle(handle)
+        if (!norm) continue
+        try {
+          const { entity, title } = await this.resolveBotEntity(client, norm)
+          const messages = await client.getMessages(entity as Api.TypeEntityLike, { limit: 8 })
+          for (const msg of messages) {
+            const buttons = extractInlineButtons(msg.replyMarkup)
+            if (buttons.length === 0) continue
+            const rawText = typeof msg.message === 'string' ? msg.message : ''
+            const sentAt = typeof msg.date === 'number' ? msg.date * 1000 : Date.now()
+            results.push({
+              botHandle: norm,
+              botTitle: title,
+              msgId: msg.id,
+              rawText,
+              sentAt,
+              buttons,
+            })
+          }
+        } catch {
+          // Skip unreachable/unstarted bot without failing the whole queue
+        }
+      }
+
+      results.sort((a, b) => b.sentAt - a.sentAt)
+      this.scanCache = { key, at: Date.now(), items: results }
+      return results
+    })()
+
+    this.scanInFlight = { key, promise: work }
+    try {
+      return await work
+    } finally {
+      if (this.scanInFlight?.promise === work) {
+        this.scanInFlight = null
+      }
+    }
   }
 
   async pressCallback(
@@ -412,6 +470,7 @@ export class MtprotoBotTransport implements BotTransport {
       // Optional confirmation read; press itself already succeeded
     }
 
+    this.scanCache = null
     return {
       answer: answer || (timedOut ? 'Bot did not answer' : 'Confirmed'),
       editedRawText,
