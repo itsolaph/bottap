@@ -4,6 +4,8 @@
 
 **Live Browser Sandbox (zero setup):** [https://bottap.pages.dev](https://bottap.pages.dev) — runs deterministic in-browser fixtures enforcing the exact same shared classifier, 2FA refusal, and two-step destructive arm-token gate without connecting to Telegram.
 
+**Demo Video (1:55, live MTProto Layer 234 + EvenHub Simulator LVGL):** [https://youtu.be/hGlkLUvwyKs](https://youtu.be/hGlkLUvwyKs)
+
 BotTap is an on-duty bot button deck for **Even Realities G2** smart glasses and the **R1 ring**, backed by a minimal self-hosted **unofficial Telegram API** gateway.
 
 Open BotTap when you want to clear pending operational alerts (uptime acks, deploy gates, on-call approvals). It scans only explicitly allowlisted bots (and optional allowlisted ops groups) for messages with inline callback buttons, shows one 40-character alert excerpt line and up to three buttons on the 576x288 monochrome waveguide display, and executes presses via `messages.getBotCallbackAnswer`.
