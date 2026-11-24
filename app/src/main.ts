@@ -63,6 +63,7 @@ let lastPairingKey = ''
 let lastAnnounced = ''
 let bridgeWriteQueue: Promise<unknown> = Promise.resolve()
 let qrPollTimer: number | null = null
+let activeQrUrl: string | null = null
 let pendingArm: { key: string; promise: Promise<string | null> } | null = null
 
 function stopQrPoll(): void {
@@ -420,8 +421,13 @@ function renderPairingModalState(): void {
   if (!statusText || !controls) return
 
   const pairing = lastStatus?.pairing
+  const effectiveQrUrl =
+    pairing?.status === 'qr_pending' ? pairing.qrUrl || activeQrUrl || undefined : undefined
+  if (pairing?.status !== 'qr_pending') {
+    activeQrUrl = null
+  }
   const pairingKey = pairing
-    ? `${pairing.mode}|${pairing.status}|${pairing.hasApiCreds}|${pairing.accountLabel ?? ''}|${pairing.phoneMask ?? ''}|${pairing.qrUrl ?? ''}`
+    ? `${pairing.mode}|${pairing.status}|${pairing.hasApiCreds}|${pairing.accountLabel ?? ''}|${pairing.phoneMask ?? ''}|${effectiveQrUrl ?? ''}`
     : 'offline'
 
   if (!pairing) {
@@ -476,6 +482,7 @@ function renderPairingModalState(): void {
   qrBtn.addEventListener('click', async () => {
     try {
       const res = await client.startQrPairing()
+      activeQrUrl = res.pairing.qrUrl ?? null
       if (feedback) {
         feedback.textContent = res.pairing.error || 'Scan QR in Telegram: Settings -> Devices -> Link Desktop Device.'
       }
@@ -485,6 +492,7 @@ function renderPairingModalState(): void {
         qrPollTimer = window.setInterval(async () => {
           try {
             const polled = await client.pollQrPairing()
+            activeQrUrl = polled.pairing.qrUrl ?? null
             if (polled.pairing.status === 'paired') {
               stopQrPoll()
               if (feedback) feedback.textContent = 'Paired.'
@@ -519,13 +527,13 @@ function renderPairingModalState(): void {
   }
   nodes.push(row)
 
-  if (pairing.qrUrl) {
+  if (effectiveQrUrl) {
     const qrPlate = document.createElement('div')
     qrPlate.className = 'qr-plate'
 
     const qrFrame = document.createElement('div')
     qrFrame.className = 'qr-frame'
-    qrFrame.append(createQrSvgElement(pairing.qrUrl, 'Telegram QR login code'))
+    qrFrame.append(createQrSvgElement(effectiveQrUrl, 'Telegram QR login code'))
 
     const qrMeta = document.createElement('div')
     qrMeta.className = 'qr-meta'
@@ -540,7 +548,7 @@ function renderPairingModalState(): void {
     copyBtn.textContent = 'Copy tg:// link'
     copyBtn.addEventListener('click', async () => {
       try {
-        await navigator.clipboard.writeText(pairing.qrUrl!)
+        await navigator.clipboard.writeText(effectiveQrUrl)
         copyBtn.textContent = 'Copied'
         window.setTimeout(() => {
           copyBtn.textContent = 'Copy tg:// link'
@@ -552,7 +560,7 @@ function renderPairingModalState(): void {
 
     const qrBox = document.createElement('div')
     qrBox.className = 'qr-readout'
-    qrBox.textContent = pairing.qrUrl
+    qrBox.textContent = effectiveQrUrl
 
     qrMeta.append(steps, copyBtn, qrBox)
     qrPlate.append(qrFrame, qrMeta)

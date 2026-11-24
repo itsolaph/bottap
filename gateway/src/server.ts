@@ -81,6 +81,26 @@ function parseAllowedOrigins(raw?: string): Set<string> {
   return out
 }
 
+function isLoopbackHostHeader(hostHeader?: string): boolean {
+  if (!hostHeader) return false
+  const raw = hostHeader.trim().toLowerCase()
+  if (raw.startsWith('[::1]')) {
+    const rest = raw.slice(5)
+    return rest === '' || /^:\d+$/.test(rest)
+  }
+  const hostname = raw.split(':')[0] ?? ''
+  return hostname === '127.0.0.1' || hostname === 'localhost'
+}
+
+function hasProxyHeaders(req: IncomingMessage): boolean {
+  return Boolean(
+    req.headers['x-forwarded-for'] ||
+      req.headers['x-forwarded-host'] ||
+      req.headers.forwarded ||
+      req.headers['cf-connecting-ip'],
+  )
+}
+
 function isSameOrigin(origin: string, hostHeader?: string): boolean {
   if (!hostHeader) return false
   const cleanOrigin = origin.trim().replace(/\/+$/, '')
@@ -284,7 +304,6 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
           {
             ok: true,
             mode: transport.mode,
-            paired: transport.getPairingState().status === 'paired',
           },
           cors.headerValue,
         )
@@ -306,8 +325,23 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
         }
       }
 
-      // Block cross-origin state-changing requests from untrusted origins
-      if ((method === 'POST' || method === 'DELETE') && !cors.allowed) {
+      // Fail closed against DNS rebinding and reverse-proxy exposure when running tokenless on loopback
+      if (!options.authToken && (hasProxyHeaders(req) || !isLoopbackHostHeader(req.headers.host))) {
+        sendJson(
+          res,
+          403,
+          {
+            ok: false,
+            code: 'TOKEN_REQUIRED_FOR_PROXY',
+            message: 'Set BOTTAP_TOKEN before accessing the gateway through a non-loopback host or proxy',
+          },
+          null,
+        )
+        return
+      }
+
+      // Block cross-origin requests from untrusted origins on all API routes
+      if (!cors.allowed) {
         sendJson(
           res,
           403,
@@ -330,12 +364,23 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
       const ip = clientIpOf(req)
 
       if (method === 'GET' && pathname === '/status') {
-        const pairing = transport.getPairingState()
-        const items = pairing.status === 'paired' ? await getFilteredQueue() : []
+        if (!limiter.allow(`read:${ip}`, 90)) {
+          sendJson(
+            res,
+            429,
+            { ok: false, code: 'RATE_LIMITED', message: 'Too many requests, retry shortly' },
+            cors.headerValue,
+          )
+          return
+        }
+        const rawPairing = transport.getPairingState()
+        // Never expose live login QR token on /status; only /pairing/qr serves qrUrl
+        const { qrUrl: _redactedQr, ...safePairing } = rawPairing
+        const items = rawPairing.status === 'paired' ? await getFilteredQueue() : []
         const payload: GatewayStatus = {
           ok: true,
           mode: transport.mode,
-          pairing,
+          pairing: safePairing,
           allowlist: store.getAllowlist(),
           pendingCount: items.length,
           recentAudit: store.getRecentAudit(),
@@ -345,6 +390,15 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
       }
 
       if (method === 'GET' && pathname === '/pending') {
+        if (!limiter.allow(`read:${ip}`, 90)) {
+          sendJson(
+            res,
+            429,
+            { ok: false, code: 'RATE_LIMITED', message: 'Too many requests, retry shortly' },
+            cors.headerValue,
+          )
+          return
+        }
         const pairing = transport.getPairingState()
         const items = pairing.status === 'paired' ? await getFilteredQueue() : []
         const payload: PendingResponse = {

@@ -168,3 +168,13 @@ test('Gateway exposes zero read-chat or send-message endpoints, blocks untrusted
     }
   }, 'secret-test-tok')
 })
+
+test('Tokenless loopback gateway blocks proxy headers and DNS-rebinding Host headers', async () => {
+  await withServer(async (baseUrl) => {
+    const proxied = await fetch(`${baseUrl}/pending`, {
+      headers: { 'X-Forwarded-For': '203.0.113.10' },
+    })
+    assert.equal(proxied.status, 403)
+    assert.equal(((await proxied.json()) as { code: string }).code, 'TOKEN_REQUIRED_FOR_PROXY')
+  })
+})
